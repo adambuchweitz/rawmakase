@@ -18,9 +18,14 @@
 //! than all the renames between them: a's checks and journalling in one
 //! transaction; then every rename; then each folder synced once, so no
 //! journal entry or row ever names a rename that isn't durable; then the
-//! names the disk gave them journalled in one transaction, and the items
-//! completed in another (each on its own, should that fail). Each folder is
-//! listed once before the renames and once after them. A crash anywhere
+//! names the disk gave them journalled in one transaction; then each item's
+//! sidecars read again from the disk, an item another file's sidecar now
+//! goes with, or that left one of its own behind, put back; and the rest
+//! completed in one transaction (each on its own, should that fail). An
+//! item is checked as if the group's earlier items had gone, as when items
+//! went one at a time. Each folder is listed once before the renames and
+//! once after them. A step that fails part way through an item makes what
+//! it renamed durable and journals it before putting it back. A crash anywhere
 //! leaves every item of the group journalled with its destinations, which
 //! recovery decides from the disk as for one item: at their sources,
 //! unchanged; all at their destinations, completed; split, for the user.
@@ -37,6 +42,7 @@
 //! undone.
 use super::super::db::{Write, sql};
 use super::super::folder_sync::locate_folders;
+use super::super::sidecar::caseless;
 use super::super::{Catalog, PhotoId};
 use super::companions::Listing;
 use super::conflicts::Names;
@@ -656,6 +662,7 @@ impl Run<'_> {
                     reason.as_deref(),
                 )?;
                 if reason.is_none() {
+                    seen.started(item);
                     started.push((id, item));
                 }
             }
@@ -667,7 +674,10 @@ impl Run<'_> {
         for (id, item) in started {
             match run.rename(item) {
                 Ok(changed) => renamed.push((id, changed)),
-                Err((changed, error)) => run.put_back(catalog, id, &changed, &error)?,
+                Err((mut changed, error)) => {
+                    run.settle(catalog, id, &mut changed);
+                    run.put_back(catalog, id, &changed, &error)?
+                }
             }
         }
         // Each folder synced once, before anything journals what is in it.
@@ -722,6 +732,28 @@ impl Run<'_> {
             }
             return Ok(());
         }
+        // Each item's sidecars as they are now, as the items were checked
+        // before the renames: one another file reads, or one left behind,
+        // puts its item back before the catalog follows.
+        let by_id: Vec<&Item> = items.iter().collect();
+        let mut verified = Vec::new();
+        let mut seen = Seen::new(&listed, self.folders, &[]);
+        for (id, changed) in renamed {
+            let item = by_id
+                .iter()
+                .find(|i| {
+                    i.members.first().map(|m| &m.source) == changed.first().map(|m| &m.source)
+                })
+                .context("a renamed item is not of its group")?;
+            match run.settled(item, &changed, &seen)? {
+                None => verified.push((id, changed)),
+                Some(why) => {
+                    run.put_back(catalog, id, &changed, &why)?;
+                    seen = Seen::new(&listed, self.folders, &[]);
+                }
+            }
+        }
+        let renamed = verified;
         // c. The catalog follows, on the evidence, in one transaction; should
         // that fail, each item in its own.
         let together = catalog.db.write_immediate(|w| {
@@ -738,6 +770,98 @@ impl Run<'_> {
             }
         }
         Ok(())
+    }
+
+    /// Members `changed` of item `id`, renamed before a step of it failed,
+    /// made durable and journalled where the disk put them, as each was
+    /// before the next step when items went one at a time, so putting them
+    /// back, or recovery should that be cut short, finds them by the names
+    /// the disk gave them. Best effort: what fails is left as it was, and
+    /// putting back decides from the disk.
+    fn settle(&self, catalog: &mut Catalog, id: OperationId, changed: &mut [Member]) {
+        let synced = changed.iter().all(|m| match &m.destination {
+            Some(to) => sync_parents(self.disk, &m.source, to).is_ok(),
+            None => false,
+        });
+        if !synced || self.kind != Kind::RenamePhotos {
+            return;
+        }
+        for m in changed.iter_mut() {
+            if let (Some(at), Some(file)) = (&m.destination, m.id)
+                && let Ok(at) = spelled(self.disk, at, file)
+            {
+                m.destination = Some(at);
+            }
+        }
+        let _ = catalog.db.write(|w| {
+            for m in changed.iter() {
+                if let Some(at) = &m.destination {
+                    journal::set_moved(w, id, m.ordinal, at)?;
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Why `item`, renamed to `changed`, can't stay so: at its destination
+    /// another file reads a sidecar it brought, or the photo reads one it
+    /// didn't; or at its source a sidecar it alone read is left behind.
+    /// Read from the disk after every rename of its group, so a change made
+    /// meanwhile, or an earlier item put back, is seen.
+    fn settled(&self, item: &Item, changed: &[Member], seen: &Seen<'_>) -> Result<Option<String>> {
+        let (Some(photo), Some(planned)) = (changed.first(), item.members.first()) else {
+            return Ok(None);
+        };
+        let Some(to) = photo.destination.as_deref() else {
+            return Ok(None);
+        };
+        let pre = &item.preconditions;
+        let usable = |dir: &Path, name: &OsStr, by: Proof| match by {
+            Proof::Names => super::proof::usable(self.disk, dir, name),
+            Proof::Ids => name.to_os_string(),
+        };
+        let (dir, here) = (parent(to), parent(to) == parent(&photo.source));
+        let new = usable(dir, to.file_name().unwrap_or_default(), pre.proofs.copies);
+        let kept = item.kept.iter().filter_map(|k| k.file_name());
+        let carried: Vec<OsString> = changed[1..]
+            .iter()
+            .filter_map(|m| m.destination.as_deref()?.file_name())
+            .chain(kept.clone().filter(|_| here))
+            .map(|n| usable(dir, n, pre.proofs.copies))
+            .collect();
+        let there = seen.folder(dir, pre.proofs.copies)?;
+        if let Some(other) = there.listing.arrival_conflict(&new, &carried, &|_| false) {
+            return Ok(Some(format!(
+                "{} there would share an XMP sidecar with it now",
+                other.to_string_lossy()
+            )));
+        }
+        let from = parent(&planned.source);
+        let old = planned.source.file_name().unwrap_or_default();
+        let same_file = |a: &OsStr, b: &OsStr| match (
+            self.disk.entry(&from.join(a)),
+            self.disk.entry(&from.join(b)),
+        ) {
+            (Ok(a), Ok(b)) => a.id == b.id,
+            _ => false,
+        };
+        let stays: Vec<OsString> = kept
+            .map(OsString::from)
+            .chain(carried.iter().cloned().filter(|_| here))
+            .collect();
+        let source = seen.folder(from, pre.proofs.originals)?;
+        let left = source
+            .listing
+            .companions(old, &same_file)
+            .carried
+            .into_iter()
+            .filter(|n| {
+                self.disk
+                    .entry(&from.join(n))
+                    .is_ok_and(|e| e.kind == EntryKind::File && e.links == 1)
+            })
+            .find(|n| !stays.contains(n));
+        Ok(left.map(|_| "its XMP sidecars changed since it was planned".into()))
     }
 
     /// Renames `item`'s members, in order, to their destinations: those
@@ -836,10 +960,11 @@ impl Run<'_> {
             (Ok(a), Ok(b)) => a.id == b.id,
             _ => false,
         };
-        let mut carried: Vec<OsString> = seen
-            .folder(dir, pre.proofs.originals)?
+        let source = seen.folder(dir, pre.proofs.originals)?;
+        let departed = |i: usize| seen.departs(dir, &source.listing.names()[i]);
+        let mut carried: Vec<OsString> = source
             .listing
-            .companions(filename, &same_file)
+            .companions_without(filename, &same_file, &departed)
             .carried
             .into_iter()
             .filter(|n| {
@@ -889,7 +1014,11 @@ impl Run<'_> {
                 .collect();
             // Its names there once everything of its group arrives, its own
             // names left out: as strict as renaming item by item.
-            let gone = |i: usize| names.get(i).is_some_and(|n| own.contains(&n.as_os_str()));
+            let gone = |i: usize| {
+                names
+                    .get(i)
+                    .is_some_and(|n| own.contains(&n.as_os_str()) || seen.departs(dir, n))
+            };
             if let Some(other) = there.arriving.arrival_conflict(new, &carried, &gone) {
                 return Ok(Some(format!(
                     "{} there would share an XMP sidecar with it now",
@@ -911,7 +1040,7 @@ impl Run<'_> {
                     return Ok(Some(format!("{} is there now", name.to_string_lossy())));
                 }
             }
-            if seen.rows.occupied(w, to, dir, new, &pre.rows)? {
+            if seen.claims(dir, new) || seen.rows.occupied(w, to, dir, new, &pre.rows)? {
                 return Ok(Some(format!(
                     "a photo of the catalog is named {} there now",
                     new.to_string_lossy()
@@ -979,7 +1108,16 @@ struct Seen<'a> {
     /// The names the items take, by folder.
     arrivals: Vec<(PathBuf, Vec<OsString>)>,
     folders: RefCell<Vec<(PathBuf, Proof, Rc<SeenFolder>)>>,
+    /// The names the items journalled to go so far leave, by folder: gone
+    /// for the items after them, as they were item by item.
+    departed: RefCell<HashSet<(PathBuf, OsString)>>,
+    /// The names those items' photos take, by `sidecar::caseless`, by
+    /// folder: the catalog's once they complete.
+    claimed: RefCell<HashSet<(PathBuf, String)>>,
 }
+
+/// Indices of a folder's names, by a key of each.
+type Keyed = std::collections::HashMap<String, Vec<usize>>;
 
 /// A folder's names, as [`Seen`] read them.
 struct SeenFolder {
@@ -989,7 +1127,7 @@ struct SeenFolder {
     /// Those, then every name the group's items take there.
     arriving: Listing,
     /// The listed names by each way of comparing them asked for.
-    keys: RefCell<Vec<(Names, std::collections::HashMap<String, Vec<usize>>)>>,
+    keys: RefCell<Vec<(Names, Keyed)>>,
 }
 
 impl<'a> Seen<'a> {
@@ -1010,7 +1148,43 @@ impl<'a> Seen<'a> {
             rows: Rows::new(folders),
             arrivals,
             folders: RefCell::default(),
+            departed: RefCell::default(),
+            claimed: RefCell::default(),
         }
+    }
+
+    /// Item `item` is journalled to go: the items after it are checked as
+    /// if its files had left and its photo's name were the catalog's.
+    fn started(&self, item: &Item) {
+        for m in &item.members {
+            if let Some(name) = m.source.file_name() {
+                let at = (parent(&m.source).to_path_buf(), name.to_os_string());
+                self.departed.borrow_mut().insert(at);
+            }
+        }
+        let photo = item.members.first().and_then(|m| m.destination.as_deref());
+        if let Some(name) = photo.and_then(Path::file_name) {
+            let at = (
+                parent(photo.unwrap_or(Path::new(""))).to_path_buf(),
+                caseless(name),
+            );
+            self.claimed.borrow_mut().insert(at);
+        }
+    }
+
+    /// Whether `name` in folder `dir` is one an earlier item leaves.
+    fn departs(&self, dir: &Path, name: &OsStr) -> bool {
+        self.departed
+            .borrow()
+            .contains(&(dir.to_path_buf(), name.to_os_string()))
+    }
+
+    /// Whether an earlier item's photo takes `name` (by `sidecar::caseless`)
+    /// in folder `dir`.
+    fn claims(&self, dir: &Path, name: &OsStr) -> bool {
+        self.claimed
+            .borrow()
+            .contains(&(dir.to_path_buf(), caseless(name)))
     }
 
     /// Folder `dir`, its names proven `by`.
@@ -1054,7 +1228,7 @@ impl SeenFolder {
         let at = match keys.iter().position(|(r, _)| r.0 == rules.0) {
             Some(at) => at,
             None => {
-                let mut by_key: std::collections::HashMap<String, Vec<usize>> = Default::default();
+                let mut by_key = Keyed::default();
                 for (i, n) in self.listing.names().iter().enumerate() {
                     by_key.entry(rules.key(n)).or_default().push(i);
                 }

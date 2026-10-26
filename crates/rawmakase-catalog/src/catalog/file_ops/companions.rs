@@ -119,6 +119,16 @@ impl Listing {
         photo: &OsStr,
         same_file: &dyn Fn(&OsStr, &OsStr) -> bool,
     ) -> Companions {
+        self.companions_without(photo, same_file, &|_| false)
+    }
+
+    /// [`Self::companions`], but for the names `left_out` says are gone.
+    pub fn companions_without(
+        &self,
+        photo: &OsStr,
+        same_file: &dyn Fn(&OsStr, &OsStr) -> bool,
+        left_out: &dyn Fn(usize) -> bool,
+    ) -> Companions {
         let mut candidates = sidecar_names(Path::new(photo));
         candidates.extend(
             companion_paths(Path::new(photo))
@@ -135,12 +145,13 @@ impl Listing {
             );
         }
         let mut out = Companions::default();
-        for name in found.into_iter().map(|i: usize| &self.names[i]) {
+        let found = found.into_iter().filter(|&i| !left_out(i));
+        for name in found.map(|i: usize| &self.names[i]) {
             if name == photo || name.to_str().is_none() {
                 continue;
             }
             if self
-                .readers(name, &|_| false)
+                .readers(name, left_out)
                 .iter()
                 .all(|r| r.as_os_str() == photo)
             {
@@ -223,6 +234,7 @@ pub(super) struct Companions {
 /// `names`: the files named as its companions are, in another case or
 /// normalisation form at most, or by a name `same_file` (whether two names
 /// there are one file object) says the volume takes for one of them.
+#[cfg(test)]
 pub(super) fn of(
     photo: &OsStr,
     names: &[OsString],
@@ -271,6 +283,7 @@ pub(super) fn renamed(photo: &OsStr, renamed: &OsStr, companion: &OsStr) -> Opti
 /// folder whose names, once everything arriving there is in, will be
 /// `projected`: the name of a file there the photo would read as its
 /// companion, or of one that would read a companion arriving with it.
+#[cfg(test)]
 pub(super) fn arrival_conflict(
     photo: &OsStr,
     carried: &[OsString],

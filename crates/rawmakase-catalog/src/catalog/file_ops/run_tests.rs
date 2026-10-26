@@ -4,6 +4,7 @@
 use super::recover_tests;
 use super::tests::*;
 use super::*;
+use crate::storage::fsops;
 use std::sync::atomic::AtomicBool;
 
 /// Photos `IMG_0000.NEF`… in one folder, every third with an XMP sidecar.
@@ -106,18 +107,22 @@ fn a_large_move_within_a_volume_commits_and_syncs_per_group() {
 }
 
 #[test]
-fn a_name_another_item_of_the_group_took_in_the_catalog_is_found() {
-    // Two photos whose names differ only in case, moved into one folder:
-    // where the volume tells them apart the disk takes both, but the
+fn a_name_another_item_of_the_group_takes_in_the_catalog_leaves_the_later_one_untouched() {
+    // Two photos whose names differ only in case, moved into one folder of
+    // a volume that tells them apart: the disk would take both, but the
     // catalog holds one photo of a name in a folder (by
-    // `sidecar::caseless`), so the second to complete is left for the
-    // user, as it was when each item was completed on its own; where it
-    // doesn't, the second rename fails and is put back.
+    // `sidecar::caseless`), so the second is left where it is, as it was
+    // when items went one at a time.
     let mut fx = fixture(&["x/a.NEF", "y/A.NEF", "sub/"]);
+    let sub = fx.root.join("sub");
+    let names = crate::storage::fsops::list(&sub).unwrap();
+    if crate::storage::fsops::probe(&sub, &names).case != crate::storage::fsops::Folding::Exact {
+        return;
+    }
     let photos = vec![fx.photo("x/a.NEF"), fx.photo("y/A.NEF")];
     let outcome = fx.run(
         FileOp::MovePhotos {
-            photos,
+            photos: photos.clone(),
             root: fx.root_id(),
             to: "sub".into(),
         },
@@ -128,13 +133,134 @@ fn a_name_another_item_of_the_group_took_in_the_catalog_is_found() {
     assert!(
         matches!(
             &results[..],
-            [ItemResult::Moved { .. }, ItemResult::NeedsRecovery(why)] if why.contains("is named")
-        ) || matches!(
-            &results[..],
-            [ItemResult::Moved { .. }, ItemResult::Unchanged(_)]
+            [ItemResult::Moved { .. }, ItemResult::Unchanged(Some(why))] if why.contains("is named")
         ),
         "{results:?}"
     );
+    let rows = fx.rows();
+    assert!(
+        photos.iter().all(|p| fx.root.join(&rows[p]).is_file()),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn a_sidecar_an_earlier_item_leaves_to_a_later_one_keeps_it_from_going() {
+    // a.CR2 and a.NEF share a.xmp, so neither carries it. Once the first is
+    // renamed, a.xmp is the other's alone: that one is left as it is, as it
+    // was when items went one at a time, rather than leave a.xmp behind.
+    let mut fx = fixture(&["a.NEF", "a.CR2", "a.xmp"]);
+    let mut ids = [fx.photo("a.NEF"), fx.photo("a.CR2")];
+    ids.sort();
+    let outcome = fx.run(
+        FileOp::RenamePhotos {
+            renames: vec![(ids[0], "first".into()), (ids[1], "later".into())],
+        },
+        &NoTrash,
+        &Faulty::default(),
+    );
+    assert!(
+        matches!(
+            &results(&outcome)[..],
+            [ItemResult::Renamed { .. }, ItemResult::Unchanged(Some(why))] if why.contains("sidecars changed")
+        ),
+        "{:?}",
+        results(&outcome)
+    );
+    assert!(fx.root.join("a.xmp").is_file());
+}
+
+#[test]
+fn a_sidecar_made_while_the_group_renames_puts_its_item_back() {
+    // Another program writes later.NEF.xmp during the first rename: the
+    // second item, renamed to later.NEF, would read it over its own
+    // later.xmp, so it is put back before the catalog follows.
+    let mut fx = fixture(&["a.NEF", "a.xmp", "b.NEF", "b.xmp"]);
+    let mut ids = [fx.photo("a.NEF"), fx.photo("b.NEF")];
+    ids.sort();
+    let raced = fx.root.join("later.NEF.xmp");
+    let written = std::cell::Cell::new(false);
+    let at = raced.clone();
+    let disk = Faulty {
+        watch: Some(Box::new(move |call: &Call| {
+            if matches!(call, Call::Rename(..)) && !written.replace(true) {
+                std::fs::write(&at, b"another program's").unwrap();
+            }
+        })),
+        ..Faulty::default()
+    };
+    let outcome = fx.run(
+        FileOp::RenamePhotos {
+            renames: vec![(ids[0], "first".into()), (ids[1], "later".into())],
+        },
+        &NoTrash,
+        &disk,
+    );
+    assert!(
+        matches!(
+            &results(&outcome)[..],
+            [ItemResult::Renamed { .. }, ItemResult::Unchanged(Some(why))] if why.contains("share an XMP sidecar")
+        ),
+        "{:?}",
+        results(&outcome)
+    );
+    let later = fx.rows()[&ids[1]].clone();
+    assert!(fx.root.join(&later).is_file(), "{later}");
+    assert_eq!(std::fs::read(&raced).unwrap(), b"another program's");
+}
+
+/// A volume that stores names decomposed (as HFS+ does): asked for
+/// "café.NEF", it names the file "cafe\u{301}.NEF".
+struct Decomposing(Faulty);
+
+impl disk::Disk for Decomposing {
+    fn entry(&self, p: &std::path::Path) -> Result<fsops::Entry, fsops::FsError> {
+        self.0.entry(p)
+    }
+    fn list(&self, d: &std::path::Path) -> Result<Vec<std::ffi::OsString>, fsops::FsError> {
+        self.0.list(d)
+    }
+    fn identity(&self, p: &std::path::Path) -> anyhow::Result<crate::storage::Identity> {
+        self.0.identity(p)
+    }
+    fn rename(&self, a: &std::path::Path, b: &std::path::Path) -> Result<(), fsops::FsError> {
+        use unicode_normalization::UnicodeNormalization;
+        let name: String = b.file_name().unwrap().to_string_lossy().nfd().collect();
+        self.0.rename(a, &b.with_file_name(name))
+    }
+    fn create_dir(&self, p: &std::path::Path) -> Result<(), fsops::FsError> {
+        self.0.create_dir(p)
+    }
+    fn sync_dir(&self, d: &std::path::Path) -> Result<(), fsops::FsError> {
+        self.0.sync_dir(d)
+    }
+    fn canonical(&self, p: &std::path::Path) -> Result<std::path::PathBuf, fsops::FsError> {
+        self.0.canonical(p)
+    }
+    passes_on!(0);
+}
+
+#[test]
+fn a_failed_sidecar_rename_puts_back_a_photo_the_disk_spelled_otherwise() {
+    // The photo is renamed (and spelled decomposed by the disk), its
+    // sidecar's rename fails: the photo is found by the name the disk gave
+    // it and put back, and the journal names it so too.
+    let mut fx = fixture(&["a.NEF", "a.xmp"]);
+    let a = fx.photo("a.NEF");
+    let outcome = fx.run(
+        FileOp::RenamePhotos {
+            renames: vec![(a, "caf\u{e9}".into())],
+        },
+        &NoTrash,
+        &Decomposing(Faulty::at(Op::Rename, 1, Fault::Fail)),
+    );
+    assert!(
+        matches!(&results(&outcome)[..], [ItemResult::Unchanged(Some(_))]),
+        "{:?}",
+        results(&outcome)
+    );
+    assert!(fx.root.join("a.NEF").is_file() && fx.root.join("a.xmp").is_file());
+    assert_eq!(fx.rows()[&a], "a.NEF");
 }
 
 /// Two groups' worth of photos in one folder, and their rename.
