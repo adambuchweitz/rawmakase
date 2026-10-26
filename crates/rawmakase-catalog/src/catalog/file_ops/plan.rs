@@ -416,6 +416,8 @@ pub(super) fn protected(path: &Path) -> bool {
 /// one directory resolve to the same directory here.
 pub(super) struct Folders {
     by_dir: HashMap<FileId, Vec<FolderId>>,
+    /// The names' `sidecar::caseless`, worked out once per plan or run.
+    pub caseless: super::disk::Caseless,
     /// The file object at each path looked up, read once per plan or run
     /// (so before anything of it moves): a volume may take two different
     /// names (`ß.NEF`, `SS.NEF`) for one file, which no folding tells.
@@ -437,6 +439,7 @@ impl Folders {
         }
         Self {
             by_dir,
+            caseless: Default::default(),
             files: Default::default(),
         }
     }
@@ -566,7 +569,7 @@ struct FolderRows {
 impl FolderRows {
     fn add(&mut self, folders: &Folders, id: PhotoId, filename: String, master: bool) {
         self.by_name
-            .entry(caseless(OsStr::new(&filename)))
+            .entry(folders.caseless.of(OsStr::new(&filename)))
             .or_default()
             .push(id);
         if master {
@@ -583,7 +586,10 @@ impl FolderRows {
     fn remove(&mut self, folders: &Folders, id: PhotoId) -> Option<bool> {
         let (filename, master) = self.photos.remove(&id)?;
         let unlist = |ids: &mut Vec<PhotoId>| ids.retain(|p| *p != id);
-        if let Some(ids) = self.by_name.get_mut(&caseless(OsStr::new(&filename))) {
+        if let Some(ids) = self
+            .by_name
+            .get_mut(&folders.caseless.of(OsStr::new(&filename)))
+        {
             unlist(ids);
         }
         for (dir, files) in &mut self.by_file {

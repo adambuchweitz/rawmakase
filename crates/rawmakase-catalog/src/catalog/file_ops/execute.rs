@@ -58,10 +58,9 @@ use super::{Confirmed, FileOpError, Outcome, Trash};
 use crate::storage::fsops::{EntryKind, FsError};
 use anyhow::{Context, Result};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Executes a confirmed plan in `catalog`, sending its files to `trash`
@@ -117,7 +116,9 @@ pub(super) fn execute_with(
     };
     let computer = catalog.computer.id.clone();
     let folders = Folders::index(&catalog.db.snapshot(|s| locate_folders(s, &computer))?);
+    let tracking = Tracking::default();
     let run = Run {
+        tracking: &tracking,
         batch: &plan.batch.0,
         computer: &computer,
         // A new folder's photos move into it.
@@ -230,6 +231,8 @@ fn rebase(items: &mut [Item], made: &Made) {
 /// What every item of a run shares.
 #[derive(Clone, Copy)]
 struct Run<'a> {
+    /// The folders its checks read.
+    tracking: &'a Tracking,
     batch: &'a str,
     computer: &'a str,
     kind: Kind,
@@ -537,7 +540,12 @@ impl Run<'_> {
             let reason = match item.preconditions.check(w, self.computer)? {
                 Some(reason) => Some(reason.to_string()),
                 None => {
-                    let seen = Seen::new(self.disk, self.folders, std::slice::from_ref(item));
+                    let seen = Seen::new(
+                        self.disk,
+                        self.tracking,
+                        self.folders,
+                        std::slice::from_ref(item),
+                    );
                     self.changed(w, item, &seen)?
                 }
             };
@@ -628,7 +636,7 @@ impl Run<'_> {
     /// or that changed since they were planned journalled as unchanged, the
     /// rest renamed, synced and completed.
     fn group(&self, catalog: &mut Catalog, items: &[Item], busy: &HashSet<PhotoId>) -> Result<()> {
-        let listed = Listed::new(self.disk);
+        let listed = Listed::new(self.disk, &self.folders.caseless);
         let run = Run {
             disk: &listed,
             ..*self
@@ -636,7 +644,7 @@ impl Run<'_> {
         // a. Checked again and journalled, in one transaction, every folder
         // listed once.
         let started: Vec<(OperationId, &Item)> = catalog.db.write_immediate(|w| {
-            let seen = Seen::new(&listed, self.folders, items);
+            let seen = Seen::new(&listed, self.tracking, self.folders, items);
             let mut started = Vec::new();
             for item in items {
                 let reason = if item.preconditions.rows.iter().any(|r| busy.contains(r)) {
@@ -737,7 +745,7 @@ impl Run<'_> {
         // puts its item back before the catalog follows.
         let by_id: Vec<&Item> = items.iter().collect();
         let mut verified = Vec::new();
-        let mut seen = Seen::new(&listed, self.folders, &[]);
+        let mut seen = Seen::new(&listed, self.tracking, self.folders, &[]);
         for (id, changed) in renamed {
             let item = by_id
                 .iter()
@@ -749,7 +757,7 @@ impl Run<'_> {
                 None => verified.push((id, changed)),
                 Some(why) => {
                     run.put_back(catalog, id, &changed, &why)?;
-                    seen = Seen::new(&listed, self.folders, &[]);
+                    seen = Seen::new(&listed, self.tracking, self.folders, &[]);
                 }
             }
         }
@@ -829,8 +837,7 @@ impl Run<'_> {
             .chain(kept.clone().filter(|_| here))
             .map(|n| usable(dir, n, pre.proofs.copies))
             .collect();
-        let there = seen.folder(dir, pre.proofs.copies)?;
-        if let Some(other) = there.listing.arrival_conflict(&new, &carried, &|_| false) {
+        if let Some(other) = seen.arrival_conflict(dir, pre.proofs.copies, &new, &carried, &[])? {
             return Ok(Some(format!(
                 "{} there would share an XMP sidecar with it now",
                 other.to_string_lossy()
@@ -849,10 +856,8 @@ impl Run<'_> {
             .map(OsString::from)
             .chain(carried.iter().cloned().filter(|_| here))
             .collect();
-        let source = seen.folder(from, pre.proofs.originals)?;
-        let left = source
-            .listing
-            .companions(old, &same_file)
+        let left = seen
+            .companions(from, pre.proofs.originals, old, &same_file)?
             .carried
             .into_iter()
             .filter(|n| {
@@ -960,11 +965,8 @@ impl Run<'_> {
             (Ok(a), Ok(b)) => a.id == b.id,
             _ => false,
         };
-        let source = seen.folder(dir, pre.proofs.originals)?;
-        let departed = |i: usize| seen.departs(dir, &source.listing.names()[i]);
-        let mut carried: Vec<OsString> = source
-            .listing
-            .companions_without(filename, &same_file, &departed)
+        let mut carried: Vec<OsString> = seen
+            .companions(dir, pre.proofs.originals, filename, &same_file)?
             .carried
             .into_iter()
             .filter(|n| {
@@ -980,8 +982,7 @@ impl Run<'_> {
         let goes = pre.to.is_some() || pre.into.is_some();
         if let (true, Some(dir)) = (goes, photo.destination.as_deref().map(parent)) {
             let to = pre.to.as_ref().map(|(to, _)| *to);
-            let there = seen.folder(dir, pre.proofs.copies)?;
-            let names = there.listing.names();
+            let by = pre.proofs.copies;
             // A rename stays in its folder, where its own names are its own.
             let here = dir == parent(&photo.source);
             let own: Vec<&OsStr> = match here {
@@ -1014,12 +1015,7 @@ impl Run<'_> {
                 .collect();
             // Its names there once everything of its group arrives, its own
             // names left out: as strict as renaming item by item.
-            let gone = |i: usize| {
-                names
-                    .get(i)
-                    .is_some_and(|n| own.contains(&n.as_os_str()) || seen.departs(dir, n))
-            };
-            if let Some(other) = there.arriving.arrival_conflict(new, &carried, &gone) {
+            if let Some(other) = seen.arrival_conflict(dir, by, new, &carried, &own)? {
                 return Ok(Some(format!(
                     "{} there would share an XMP sidecar with it now",
                     other.to_string_lossy()
@@ -1030,7 +1026,10 @@ impl Run<'_> {
                     continue;
                 };
                 let mine = |n: &OsStr| here && m.source.file_name() == Some(n);
-                let listed = there.alike(item.rules, name).into_iter().any(|n| !mine(n));
+                let listed = seen
+                    .alike(dir, by, item.rules, name)?
+                    .iter()
+                    .any(|n| !mine(n));
                 let found = match self.disk.entry(&dir.join(name)) {
                     Err(FsError::NotFound) => false,
                     Ok(e) => !(here && e.id == m.id),
@@ -1048,9 +1047,10 @@ impl Run<'_> {
             }
             // Its partial copies' names are free.
             for temp in item.copy.iter().flat_map(|c| &c.temps) {
-                let listed = temp
-                    .file_name()
-                    .is_some_and(|t| names.iter().any(|n| n == t));
+                let listed = match temp.file_name() {
+                    Some(t) => seen.lists(dir, by, t)?,
+                    None => false,
+                };
                 if listed || !matches!(self.disk.entry(temp), Err(FsError::NotFound)) {
                     return Ok(Some(format!("{} is there now", temp.display())));
                 }
@@ -1096,18 +1096,125 @@ fn respell(listed: &Listed<'_>, changed: &mut [Member]) -> Result<(), FsError> {
     Ok(())
 }
 
-/// What the checks of a group's items read of each folder, once, before
-/// any of its steps (#681): its names, as the plan used them, keyed for
-/// what is asked of each item, every name the group's items take there,
-/// and the catalog's photos there. Valid only in the transaction that
-/// journals them, which changes no photo's row.
+/// A folder's names as a run has read them, each keyed once (#681): each
+/// listing read again only adds the names new since and marks those gone
+/// that it lacks, so what a group's checks cost grows with its own names,
+/// not the folder's, though each reads the folder as it is then.
+struct Tracked {
+    listing: Listing,
+    /// Where each name now in the folder is in `listing`.
+    live: HashMap<OsString, usize>,
+    /// Names no longer in the folder, or never: only taken for arriving.
+    gone: HashSet<usize>,
+    /// The names by each way of comparing them asked for.
+    keys: Vec<(Names, Keyed)>,
+    /// Each name as the plan took it, where the drive lists them decomposed
+    /// (#573), by its spelling as listed.
+    usable: HashMap<OsString, OsString>,
+}
+
+/// Indices of a folder's names, by a key of each.
+type Keyed = HashMap<String, Vec<usize>>;
+
+/// The folders a run's checks read, each as [`Tracked`], by how its names
+/// are proven.
+#[derive(Default)]
+pub(super) struct Tracking(RefCell<Vec<((PathBuf, Proof), Tracked)>>);
+
+impl Tracked {
+    fn new() -> Self {
+        Self {
+            listing: Listing::new(Vec::new()),
+            live: HashMap::new(),
+            gone: HashSet::new(),
+            keys: Vec::new(),
+            usable: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, name: OsString) -> usize {
+        for (rules, by_key) in &mut self.keys {
+            let i = self.listing.names().len();
+            by_key.entry(rules.key(&name)).or_default().push(i);
+        }
+        self.listing.push(name)
+    }
+
+    /// The folder lists `names` now.
+    fn update(&mut self, names: Vec<OsString>) {
+        let now: HashSet<&OsString> = names.iter().collect();
+        let left: Vec<OsString> = self
+            .live
+            .keys()
+            .filter(|n| !now.contains(n))
+            .cloned()
+            .collect();
+        for name in left {
+            if let Some(i) = self.live.remove(&name) {
+                self.gone.insert(i);
+            }
+        }
+        for name in names {
+            if !self.live.contains_key(&name) {
+                let i = self.push(name.clone());
+                self.live.insert(name, i);
+            }
+        }
+    }
+
+    /// Adds `names`, not in the folder, as gone: there only for whoever
+    /// asks with their indices.
+    fn assume(&mut self, names: &[OsString]) -> Vec<usize> {
+        let new: Vec<OsString> = names
+            .iter()
+            .filter(|n| !self.live.contains_key(*n))
+            .cloned()
+            .collect();
+        new.into_iter()
+            .map(|n| {
+                let i = self.push(n);
+                self.gone.insert(i);
+                i
+            })
+            .collect()
+    }
+
+    /// The indices of the names `rules` takes for `name`, gone or not.
+    fn alike(&mut self, rules: Names, name: &OsStr) -> Vec<usize> {
+        let at = match self.keys.iter().position(|(r, _)| r.0 == rules.0) {
+            Some(at) => at,
+            None => {
+                let mut by_key = Keyed::default();
+                for (i, n) in self.listing.names().iter().enumerate() {
+                    by_key.entry(rules.key(n)).or_default().push(i);
+                }
+                self.keys.push((rules, by_key));
+                self.keys.len() - 1
+            }
+        };
+        self.keys[at]
+            .1
+            .get(&rules.key(name))
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// What the checks of a group's items read of each folder: the folder as
+/// listed when first asked about ([`Tracking`]), every name the group's
+/// items take there, the names those journalled to go so far leave and
+/// take, and the catalog's photos there. Before the renames, valid only in
+/// the transaction that journals the items, which changes no photo's row;
+/// after them, in none.
 struct Seen<'a> {
     disk: &'a dyn Disk,
+    tracking: &'a Tracking,
     /// The catalog's photos of each folder asked about.
     rows: Rows<'a>,
     /// The names the items take, by folder.
     arrivals: Vec<(PathBuf, Vec<OsString>)>,
-    folders: RefCell<Vec<(PathBuf, Proof, Rc<SeenFolder>)>>,
+    /// The folders listed so far, with where the arrivals there are.
+    read: RefCell<Vec<((PathBuf, Proof), HashSet<usize>)>>,
     /// The names the items journalled to go so far leave, by folder: gone
     /// for the items after them, as they were item by item.
     departed: RefCell<HashSet<(PathBuf, OsString)>>,
@@ -1116,22 +1223,13 @@ struct Seen<'a> {
     claimed: RefCell<HashSet<(PathBuf, String)>>,
 }
 
-/// Indices of a folder's names, by a key of each.
-type Keyed = std::collections::HashMap<String, Vec<usize>>;
-
-/// A folder's names, as [`Seen`] read them.
-struct SeenFolder {
-    /// As listed, or as the plan took them where the drive lists them
-    /// decomposed (#573).
-    listing: Listing,
-    /// Those, then every name the group's items take there.
-    arriving: Listing,
-    /// The listed names by each way of comparing them asked for.
-    keys: RefCell<Vec<(Names, Keyed)>>,
-}
-
 impl<'a> Seen<'a> {
-    fn new(disk: &'a dyn Disk, folders: &'a Folders, items: &[Item]) -> Self {
+    fn new(
+        disk: &'a dyn Disk,
+        tracking: &'a Tracking,
+        folders: &'a Folders,
+        items: &[Item],
+    ) -> Self {
         let mut arrivals: Vec<(PathBuf, Vec<OsString>)> = Vec::new();
         let taken = items.iter().flat_map(|i| &i.members);
         for to in taken.filter_map(|m| m.destination.as_deref()) {
@@ -1145,9 +1243,10 @@ impl<'a> Seen<'a> {
         }
         Self {
             disk,
+            tracking,
             rows: Rows::new(folders),
             arrivals,
-            folders: RefCell::default(),
+            read: RefCell::default(),
             departed: RefCell::default(),
             claimed: RefCell::default(),
         }
@@ -1187,64 +1286,106 @@ impl<'a> Seen<'a> {
             .contains(&(dir.to_path_buf(), caseless(name)))
     }
 
-    /// Folder `dir`, its names proven `by`.
-    fn folder(&self, dir: &Path, by: Proof) -> Result<Rc<SeenFolder>> {
-        let found = self
-            .folders
-            .borrow()
-            .iter()
-            .find_map(|(d, p, f)| (d == dir && *p == by).then(|| f.clone()));
-        if let Some(folder) = found {
-            return Ok(folder);
-        }
-        let names = self.disk.list(dir).map_err(anyhow::Error::from)?;
-        let names: Vec<OsString> = match by {
-            Proof::Names => names
-                .iter()
-                .map(|n| super::proof::usable(self.disk, dir, n))
-                .collect(),
-            Proof::Ids => names,
-        };
-        let mut arriving = names.clone();
-        if let Some((_, taken)) = self.arrivals.iter().find(|(d, _)| d == dir) {
-            arriving.extend(taken.iter().cloned());
-        }
-        let folder = Rc::new(SeenFolder {
-            listing: Listing::new(names),
-            arriving: Listing::new(arriving),
-            keys: RefCell::default(),
-        });
-        self.folders
-            .borrow_mut()
-            .push((dir.to_path_buf(), by, folder.clone()));
-        Ok(folder)
-    }
-}
-
-impl SeenFolder {
-    /// The listed names `rules` takes for `name`.
-    fn alike(&self, rules: Names, name: &OsStr) -> Vec<&OsString> {
-        let mut keys = self.keys.borrow_mut();
-        let at = match keys.iter().position(|(r, _)| r.0 == rules.0) {
+    /// Runs `f` on folder `dir`, its names proven `by`, listed when first
+    /// asked about, with where the group's arrivals there are.
+    fn with<R>(
+        &self,
+        dir: &Path,
+        by: Proof,
+        f: impl FnOnce(&mut Tracked, &HashSet<usize>) -> R,
+    ) -> Result<R> {
+        let key = (dir.to_path_buf(), by);
+        let mut tracking = self.tracking.0.borrow_mut();
+        let at = match tracking.iter().position(|(k, _)| *k == key) {
             Some(at) => at,
             None => {
-                let mut by_key = Keyed::default();
-                for (i, n) in self.listing.names().iter().enumerate() {
-                    by_key.entry(rules.key(n)).or_default().push(i);
-                }
-                keys.push((rules, by_key));
-                keys.len() - 1
+                tracking.push((key.clone(), Tracked::new()));
+                tracking.len() - 1
             }
         };
-        let found = keys[at]
-            .1
-            .get(&rules.key(name))
-            .cloned()
-            .unwrap_or_default();
-        found
-            .into_iter()
-            .map(|i| &self.listing.names()[i])
-            .collect()
+        let folder = &mut tracking[at].1;
+        let mut read = self.read.borrow_mut();
+        let found = match read.iter().position(|(k, _)| *k == key) {
+            Some(found) => found,
+            None => {
+                let names = self.disk.list(dir).map_err(anyhow::Error::from)?;
+                let names: Vec<OsString> = match by {
+                    Proof::Names => names
+                        .into_iter()
+                        .map(|n| {
+                            let usable = folder
+                                .usable
+                                .entry(n.clone())
+                                .or_insert_with(|| super::proof::usable(self.disk, dir, &n));
+                            usable.clone()
+                        })
+                        .collect(),
+                    Proof::Ids => names,
+                };
+                folder.update(names);
+                let taken = self.arrivals.iter().find(|(d, _)| d == dir);
+                let assumed = taken.map_or_else(Vec::new, |(_, names)| folder.assume(names));
+                read.push((key, assumed.into_iter().collect()));
+                read.len() - 1
+            }
+        };
+        Ok(f(folder, &read[found].1))
+    }
+
+    /// The companions of the file named `photo` in folder `dir` (as
+    /// [`Listing::companions`]), as if the group's earlier items had gone.
+    fn companions(
+        &self,
+        dir: &Path,
+        by: Proof,
+        photo: &OsStr,
+        same_file: &dyn Fn(&OsStr, &OsStr) -> bool,
+    ) -> Result<super::companions::Companions> {
+        self.with(dir, by, |folder, _| {
+            let names = folder.listing.names();
+            let left_out = |i: usize| folder.gone.contains(&i) || self.departs(dir, &names[i]);
+            folder
+                .listing
+                .companions_without(photo, same_file, &left_out)
+        })
+    }
+
+    /// [`Listing::arrival_conflict`] in folder `dir` once the group's items
+    /// arrive and its earlier items have gone, but for names `own`.
+    fn arrival_conflict(
+        &self,
+        dir: &Path,
+        by: Proof,
+        photo: &OsStr,
+        carried: &[OsString],
+        own: &[&OsStr],
+    ) -> Result<Option<OsString>> {
+        self.with(dir, by, |folder, arriving| {
+            let names = folder.listing.names();
+            let left_out = |i: usize| {
+                (folder.gone.contains(&i) && !arriving.contains(&i))
+                    || own.contains(&names[i].as_os_str())
+                    || self.departs(dir, &names[i])
+            };
+            folder.listing.arrival_conflict(photo, carried, &left_out)
+        })
+    }
+
+    /// The names in folder `dir` that `rules` takes for `name`.
+    fn alike(&self, dir: &Path, by: Proof, rules: Names, name: &OsStr) -> Result<Vec<OsString>> {
+        self.with(dir, by, |folder, _| {
+            let found = folder.alike(rules, name);
+            found
+                .into_iter()
+                .filter(|i| !folder.gone.contains(i))
+                .map(|i| folder.listing.names()[i].clone())
+                .collect()
+        })
+    }
+
+    /// Whether folder `dir` lists exactly `name`.
+    fn lists(&self, dir: &Path, by: Proof, name: &OsStr) -> Result<bool> {
+        self.with(dir, by, |folder, _| folder.live.contains_key(name))
     }
 }
 

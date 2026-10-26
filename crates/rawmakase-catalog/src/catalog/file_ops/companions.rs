@@ -55,26 +55,33 @@ impl Listing {
             legacy_readers: HashMap::new(),
             names: Vec::new(),
         };
-        let add = |map: &mut HashMap<String, Vec<usize>>, key: String, i: usize| {
+        for name in names {
+            listing.push(name);
+        }
+        listing
+    }
+
+    /// Adds `name` after the others, keyed as they are; returns where.
+    pub fn push(&mut self, name: OsString) -> usize {
+        let i = self.names.len();
+        let add = |map: &mut HashMap<String, Vec<usize>>, key: String| {
             let at = map.entry(key).or_default();
             if at.last() != Some(&i) {
                 at.push(i);
             }
         };
-        for (i, name) in names.iter().enumerate() {
-            add(&mut listing.folded, folded(name), i);
-            add(&mut listing.caseless, caseless(name), i);
-            if name.to_str().is_some() {
-                for sidecar in sidecar_names_caseless(Path::new(name)) {
-                    add(&mut listing.sidecar_readers, sidecar, i);
-                }
-            }
-            for legacy in companion_paths(Path::new(name)) {
-                add(&mut listing.legacy_readers, caseless(legacy.as_os_str()), i);
+        add(&mut self.folded, folded(&name));
+        add(&mut self.caseless, caseless(&name));
+        if name.to_str().is_some() {
+            for sidecar in sidecar_names_caseless(Path::new(&name)) {
+                add(&mut self.sidecar_readers, sidecar);
             }
         }
-        listing.names = names;
-        listing
+        for legacy in companion_paths(Path::new(&name)) {
+            add(&mut self.legacy_readers, caseless(legacy.as_os_str()));
+        }
+        self.names.push(name);
+        i
     }
 
     pub fn names(&self) -> &[OsString] {

@@ -242,7 +242,24 @@ fn one_spelling<'n>(
 /// later: the names it decides on are looked up as well.
 pub(super) struct Listed<'a> {
     disk: &'a dyn Disk,
+    caseless: &'a Caseless,
     listings: RefCell<HashMap<PathBuf, Rc<Listing>>>,
+}
+
+/// `sidecar::caseless` of each name asked about, worked out once (#681): a
+/// run asks it of every name of a folder for each group of its items.
+#[derive(Default)]
+pub(super) struct Caseless(RefCell<HashMap<OsString, String>>);
+
+impl Caseless {
+    pub fn of(&self, name: &OsStr) -> String {
+        if let Some(key) = self.0.borrow().get(name) {
+            return key.clone();
+        }
+        let key = super::super::sidecar::caseless(name);
+        self.0.borrow_mut().insert(name.to_os_string(), key.clone());
+        key
+    }
 }
 
 /// A folder's names, with those `sidecar::caseless` takes for one another
@@ -253,9 +270,10 @@ struct Listing {
 }
 
 impl<'a> Listed<'a> {
-    pub fn new(disk: &'a dyn Disk) -> Self {
+    pub fn new(disk: &'a dyn Disk, caseless: &'a Caseless) -> Self {
         Self {
             disk,
+            caseless,
             listings: RefCell::default(),
         }
     }
@@ -267,10 +285,7 @@ impl<'a> Listed<'a> {
         let names = self.disk.list(dir)?;
         let mut caseless: HashMap<String, Vec<usize>> = HashMap::new();
         for (i, name) in names.iter().enumerate() {
-            caseless
-                .entry(super::super::sidecar::caseless(name))
-                .or_default()
-                .push(i);
+            caseless.entry(self.caseless.of(name)).or_default().push(i);
         }
         let listing = Rc::new(Listing { names, caseless });
         self.listings
@@ -290,7 +305,7 @@ impl<'a> Listed<'a> {
     pub fn spelled(&self, path: &Path, id: FileId) -> Result<PathBuf, FsError> {
         let dir = parent(path);
         let listing = self.listing(dir)?;
-        let wanted = super::super::sidecar::caseless(path.file_name().unwrap_or_default());
+        let wanted = self.caseless.of(path.file_name().unwrap_or_default());
         let alike = listing
             .caseless
             .get(&wanted)
@@ -310,7 +325,7 @@ impl Disk for Listed<'_> {
     }
     fn lists(&self, dir: &Path, name: &OsStr) -> Result<bool, FsError> {
         let listing = self.listing(dir)?;
-        let alike = listing.caseless.get(&super::super::sidecar::caseless(name));
+        let alike = listing.caseless.get(&self.caseless.of(name));
         Ok(alike.is_some_and(|at| at.iter().any(|&i| listing.names[i] == name)))
     }
     fn identity(&self, path: &Path) -> anyhow::Result<Identity> {
