@@ -13,6 +13,18 @@
 //!    catalog change and `done`. Should that fail, the item is
 //!    `needs_recovery` and recovery retries it.
 //!
+//! A rename, or a move within a volume, takes these steps for up to
+//! [`GROUP`] items at a time (#681), as one commit and one sync cost more
+//! than all the renames between them: a's checks and journalling in one
+//! transaction; then every rename; then each folder synced once, so no
+//! journal entry or row ever names a rename that isn't durable; then the
+//! names the disk gave them journalled in one transaction, and the items
+//! completed in another (each on its own, should that fail). Each folder is
+//! listed once before the renames and once after them. A crash anywhere
+//! leaves every item of the group journalled with its destinations, which
+//! recovery decides from the disk as for one item: at their sources,
+//! unchanged; all at their destinations, completed; split, for the user.
+//!
 //! A move to another volume copies instead of renaming in b, and puts the
 //! originals in the Trash after c (see [`super::copy`]); anything failing
 //! before c undoes it.
@@ -20,24 +32,30 @@
 //! A plan that makes a folder makes it first, as its own item (see
 //! [`super::folder`]); its moves go on only once the catalog has it.
 //!
-//! Cancelling stops between items, and between the chunks of a copy, whose
-//! item is then undone.
+//! Cancelling stops between items (between groups, for a rename or a move
+//! within a volume), and between the chunks of a copy, whose item is then
+//! undone.
 use super::super::db::{Write, sql};
 use super::super::folder_sync::locate_folders;
 use super::super::{Catalog, PhotoId};
-use super::companions;
-use super::disk::{Disk, Presence, Real, gone, parent, presence, spelled, sync_parents};
+use super::companions::Listing;
+use super::conflicts::Names;
+use super::disk::{Disk, Listed, Presence, Real, gone, parent, presence, spelled, sync_parents};
 use super::folder::{self, Made, NewFolder};
 use super::journal::{
     self, Item as Journalled, ItemState, Kind, Member, MemberState, OperationId, Subject,
 };
-use super::plan::{Folders, Item, occupied, shared};
+use super::plan::{Folders, Item, Rows};
+use super::proof::Proof;
 use super::tree::TreeMove;
 use super::{Confirmed, FileOpError, Outcome, Trash};
 use crate::storage::fsops::{EntryKind, FsError};
 use anyhow::{Context, Result};
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Executes a confirmed plan in `catalog`, sending its files to `trash`
@@ -134,17 +152,31 @@ pub(super) fn execute_with(
             stopped = Some(format!("{e:#}"));
         }
     }
-    for item in items {
+    let mut rest = &items[..];
+    while let Some(item) = rest.first() {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let result = if item.preconditions.rows.iter().any(|r| busy.contains(r)) {
-            run.unchanged(catalog, &item, UNFINISHED)
+        // Renames on one volume go in groups; a copy, a Trash or a removal
+        // item by item.
+        let renames = |i: &Item| {
+            matches!(run.kind, Kind::MovePhotos | Kind::RenamePhotos) && i.copy.is_none()
+        };
+        let taken = match renames(item) {
+            true => rest.iter().take(GROUP).take_while(|i| renames(i)).count(),
+            false => 1,
+        };
+        let (now, later) = rest.split_at(taken);
+        rest = later;
+        let result = if renames(item) {
+            run.group(catalog, now, &busy)
+        } else if item.preconditions.rows.iter().any(|r| busy.contains(r)) {
+            run.unchanged(catalog, item, UNFINISHED)
         } else {
             match run.kind {
-                Kind::RemoveFromCatalog => run.remove(catalog, &item),
+                Kind::RemoveFromCatalog => run.remove(catalog, item),
                 Kind::MovePhotos | Kind::TrashPhotos | Kind::CreateFolder | Kind::RenamePhotos => {
-                    run.files(catalog, &item, cancel)
+                    run.files(catalog, item, cancel)
                 }
                 // A folder rename, move or Trash has no photo items.
                 Kind::RenameFolder | Kind::MoveFolder | Kind::TrashFolder => Ok(()),
@@ -161,6 +193,10 @@ pub(super) fn execute_with(
     outcome.stopped = stopped;
     Ok(outcome)
 }
+
+/// How many items of a rename or move are journalled, renamed, synced and
+/// completed together.
+pub(super) const GROUP: usize = 64;
 
 /// Why a photo an unfinished file operation involves is left alone.
 pub(super) const UNFINISHED: &str = "an unfinished file operation involves it";
@@ -186,6 +222,7 @@ fn rebase(items: &mut [Item], made: &Made) {
 }
 
 /// What every item of a run shares.
+#[derive(Clone, Copy)]
 struct Run<'a> {
     batch: &'a str,
     computer: &'a str,
@@ -487,13 +524,16 @@ impl Run<'_> {
         }
     }
 
-    /// An item that moves or trashes files.
+    /// An item that trashes its files, or copies them to another volume.
     fn files(&self, catalog: &mut Catalog, item: &Item, cancel: &AtomicBool) -> Result<()> {
         // a. Checked again and journalled, in one transaction.
         let started = catalog.db.write_immediate(|w| {
             let reason = match item.preconditions.check(w, self.computer)? {
                 Some(reason) => Some(reason.to_string()),
-                None => self.changed(w, item)?,
+                None => {
+                    let seen = Seen::new(self.disk, self.folders, std::slice::from_ref(item));
+                    self.changed(w, item, &seen)?
+                }
             };
             let state = match reason {
                 None => ItemState::Planned,
@@ -525,20 +565,9 @@ impl Run<'_> {
         // what follows it succeeds.
         let mut changed: Vec<Member> = Vec::new();
         for (ordinal, m) in item.members.iter().enumerate() {
-            let (receipt, after) = match (self.kind, &m.destination) {
-                (Kind::TrashPhotos, _) => match self.trash.trash(&m.source) {
-                    Ok(receipt) => (Some(receipt.location.clone()), receipt.location),
-                    Err(e) => return self.put_back(catalog, id, &changed, &e.to_string()),
-                },
-                (_, Some(to)) => match self.disk.rename(&m.source, to) {
-                    Ok(()) => (None, to.clone()),
-                    Err(e) => return self.put_back(catalog, id, &changed, &e.to_string()),
-                },
-                (_, None) => return self.put_back(catalog, id, &changed, "no destination"),
-            };
-            let state = match receipt {
-                Some(_) => MemberState::Trashed,
-                None => MemberState::Moved,
+            let receipt = match self.trash.trash(&m.source) {
+                Ok(receipt) => receipt.location,
+                Err(e) => return self.put_back(catalog, id, &changed, &e.to_string()),
             };
             changed.push(Member {
                 ordinal: ordinal as i64,
@@ -546,47 +575,37 @@ impl Run<'_> {
                 destination: m.destination.clone(),
                 id: Some(m.id),
                 identity: Some(m.identity.clone()),
-                state,
-                receipt: receipt.clone(),
+                state: MemberState::Trashed,
+                receipt: Some(receipt.clone()),
                 copy: None,
             });
-            let mut after = after;
             // The Trash keeps its own folders durable, and may not let them be
             // opened (macOS's needs Full Disk Access).
-            let synced = match receipt {
-                Some(_) => self.disk.sync_dir(parent(&m.source)),
-                None => sync_parents(self.disk, &m.source, &after),
-            };
-            if let Err(e) = synced {
+            if let Err(e) = self.disk.sync_dir(parent(&m.source)) {
                 return self.put_back(catalog, id, &changed, &e.to_string());
             }
-            // A name given by the user is journalled as the disk spells it,
-            // which a volume that normalises names may not as given.
-            if self.kind == Kind::RenamePhotos {
-                match spelled(self.disk, &after, m.id) {
-                    Ok(at) => after = at,
-                    Err(e) => return self.put_back(catalog, id, &changed, &e.to_string()),
-                }
-                if let Some(last) = changed.last_mut() {
-                    last.destination = Some(after.clone());
-                }
-            }
-            let journalled = match self.kind {
-                Kind::RenamePhotos => catalog
-                    .db
-                    .write(|w| journal::set_moved(w, id, ordinal as i64, &after)),
-                _ => catalog.db.write(|w| {
-                    journal::set_member(w, id, ordinal as i64, state, receipt.as_deref())
-                }),
-            };
+            let journalled = catalog.db.write(|w| {
+                journal::set_member(w, id, ordinal as i64, MemberState::Trashed, Some(&receipt))
+            });
             if let Err(e) = journalled {
                 return self.put_back(catalog, id, &changed, &format!("{e:#}"));
             }
         }
-        // c. The catalog follows, on the evidence.
+        self.finish(catalog, id)
+    }
+
+    /// c. for journalled item `id`, in a transaction of its own: the catalog
+    /// follows, on the evidence, or the item is left for recovery.
+    fn finish(&self, catalog: &mut Catalog, id: OperationId) -> Result<()> {
         let finished = catalog.db.write_immediate(|w| {
             let journalled = journal::item(w, id)?.context("the journalled item is gone")?;
-            complete(w, self.computer, self.folders, self.disk, &journalled)
+            complete(
+                w,
+                self.computer,
+                &Rows::new(self.folders),
+                self.disk,
+                &journalled,
+            )
         });
         if let Err(e) = finished {
             let error = format!("{e:#}");
@@ -598,10 +617,158 @@ impl Run<'_> {
         Ok(())
     }
 
+    /// `items` of a rename or of a move within a volume, together (see the
+    /// module's steps): those an unfinished operation involves (in `busy`)
+    /// or that changed since they were planned journalled as unchanged, the
+    /// rest renamed, synced and completed.
+    fn group(&self, catalog: &mut Catalog, items: &[Item], busy: &HashSet<PhotoId>) -> Result<()> {
+        let listed = Listed::new(self.disk);
+        let run = Run {
+            disk: &listed,
+            ..*self
+        };
+        // a. Checked again and journalled, in one transaction, every folder
+        // listed once.
+        let started: Vec<(OperationId, &Item)> = catalog.db.write_immediate(|w| {
+            let seen = Seen::new(&listed, self.folders, items);
+            let mut started = Vec::new();
+            for item in items {
+                let reason = if item.preconditions.rows.iter().any(|r| busy.contains(r)) {
+                    Some(UNFINISHED.to_string())
+                } else {
+                    match item.preconditions.check(w, self.computer)? {
+                        Some(reason) => Some(reason.to_string()),
+                        None => run.changed(w, item, &seen)?,
+                    }
+                };
+                let state = match reason {
+                    None => ItemState::Planned,
+                    Some(_) => ItemState::NoChange,
+                };
+                let id = journal::insert(
+                    w,
+                    self.batch,
+                    self.computer,
+                    self.kind,
+                    state,
+                    &item.preconditions,
+                    &item.members,
+                    reason.as_deref(),
+                )?;
+                if reason.is_none() {
+                    started.push((id, item));
+                }
+            }
+            Ok(started)
+        })?;
+        // b. Every rename. One that fails puts its item back; a step that
+        // happened counts as changed from then on.
+        let mut renamed: Vec<(OperationId, Vec<Member>)> = Vec::new();
+        for (id, item) in started {
+            match run.rename(item) {
+                Ok(changed) => renamed.push((id, changed)),
+                Err((changed, error)) => run.put_back(catalog, id, &changed, &error)?,
+            }
+        }
+        // Each folder synced once, before anything journals what is in it.
+        let mut dirs: Vec<&Path> = Vec::new();
+        for m in renamed.iter().flat_map(|(_, members)| members) {
+            for dir in [
+                Some(parent(&m.source)),
+                m.destination.as_deref().map(parent),
+            ] {
+                if let Some(dir) = dir
+                    && !dirs.contains(&dir)
+                {
+                    dirs.push(dir);
+                }
+            }
+        }
+        if let Some(e) = dirs.iter().find_map(|dir| listed.sync_dir(dir).err()) {
+            for (id, changed) in &renamed {
+                run.put_back(catalog, *id, changed, &e.to_string())?;
+            }
+            return Ok(());
+        }
+        // A name given by the user is journalled as the disk spells it,
+        // which a volume that normalises names may not as given.
+        if self.kind == Kind::RenamePhotos {
+            let mut spelled = Vec::new();
+            for (id, mut changed) in renamed {
+                match respell(&listed, &mut changed) {
+                    Ok(()) => spelled.push((id, changed)),
+                    Err(e) => run.put_back(catalog, id, &changed, &e.to_string())?,
+                }
+            }
+            renamed = spelled;
+        }
+        let journalled = catalog.db.write(|w| {
+            for (id, changed) in &renamed {
+                for m in changed {
+                    match (self.kind, m.destination.as_deref()) {
+                        (Kind::RenamePhotos, Some(at)) => {
+                            journal::set_moved(w, *id, m.ordinal, at)?
+                        }
+                        _ => journal::set_member(w, *id, m.ordinal, MemberState::Moved, None)?,
+                    }
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = journalled {
+            let error = format!("{e:#}");
+            for (id, changed) in &renamed {
+                run.put_back(catalog, *id, changed, &error)?;
+            }
+            return Ok(());
+        }
+        // c. The catalog follows, on the evidence, in one transaction; should
+        // that fail, each item in its own.
+        let together = catalog.db.write_immediate(|w| {
+            let rows = Rows::new(self.folders);
+            for (id, _) in &renamed {
+                let journalled = journal::item(w, *id)?.context("the journalled item is gone")?;
+                complete(w, self.computer, &rows, &listed, &journalled)?;
+            }
+            Ok(())
+        });
+        if together.is_err() {
+            for (id, _) in &renamed {
+                run.finish(catalog, *id)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Renames `item`'s members, in order, to their destinations: those
+    /// renamed, or, when one fails, those renamed before it and why.
+    fn rename(&self, item: &Item) -> std::result::Result<Vec<Member>, (Vec<Member>, String)> {
+        let mut changed: Vec<Member> = Vec::new();
+        for (ordinal, m) in item.members.iter().enumerate() {
+            let Some(to) = &m.destination else {
+                return Err((changed, "no destination".into()));
+            };
+            if let Err(e) = self.disk.rename(&m.source, to) {
+                return Err((changed, e.to_string()));
+            }
+            changed.push(Member {
+                ordinal: ordinal as i64,
+                source: m.source.clone(),
+                destination: Some(to.clone()),
+                id: Some(m.id),
+                identity: Some(m.identity.clone()),
+                state: MemberState::Moved,
+                receipt: None,
+                copy: None,
+            });
+        }
+        Ok(changed)
+    }
+
     /// Why `item`'s files are no longer as planned, read just before it is
     /// journalled: a file changed or gone, another photo over the same
     /// file, or the destination taken since.
-    fn changed(&self, w: &Write<'_>, item: &Item) -> Result<Option<String>> {
+    fn changed(&self, w: &Write<'_>, item: &Item, seen: &Seen<'_>) -> Result<Option<String>> {
         let pre = &item.preconditions;
         for m in &item.members {
             let same = match self.disk.entry(&m.source) {
@@ -639,9 +806,8 @@ impl Run<'_> {
             }
         }
         let filename = photo.source.file_name().unwrap_or_default();
-        if shared(
+        if seen.rows.shared(
             w,
-            self.folders,
             parent(&photo.source),
             filename,
             Some(photo.id),
@@ -660,21 +826,6 @@ impl Run<'_> {
             .filter_map(|p| p.file_name().map(OsString::from))
             .collect();
         planned.sort();
-        // As the plan took them where the drive lists them decomposed
-        // (#573).
-        let usable = |dir: &std::path::Path, names: Vec<OsString>, by: super::proof::Proof| match by
-        {
-            super::proof::Proof::Names => names
-                .iter()
-                .map(|n| super::proof::usable(self.disk, dir, n))
-                .collect(),
-            super::proof::Proof::Ids => names,
-        };
-        let names = self
-            .disk
-            .list(parent(&photo.source))
-            .map_err(anyhow::Error::from)?;
-        let names = usable(parent(&photo.source), names, pre.proofs.originals);
         // Those it carries, as the plan chose them: a companion with another
         // name elsewhere stays.
         let dir = parent(&photo.source);
@@ -685,7 +836,10 @@ impl Run<'_> {
             (Ok(a), Ok(b)) => a.id == b.id,
             _ => false,
         };
-        let mut carried: Vec<OsString> = companions::of(filename, &names, &same_file)
+        let mut carried: Vec<OsString> = seen
+            .folder(dir, pre.proofs.originals)?
+            .listing
+            .companions(filename, &same_file)
             .carried
             .into_iter()
             .filter(|n| {
@@ -701,8 +855,8 @@ impl Run<'_> {
         let goes = pre.to.is_some() || pre.into.is_some();
         if let (true, Some(dir)) = (goes, photo.destination.as_deref().map(parent)) {
             let to = pre.to.as_ref().map(|(to, _)| *to);
-            let names = self.disk.list(dir).map_err(anyhow::Error::from)?;
-            let names = usable(dir, names, pre.proofs.copies);
+            let there = seen.folder(dir, pre.proofs.copies)?;
+            let names = there.listing.names();
             // A rename stays in its folder, where its own names are its own.
             let here = dir == parent(&photo.source);
             let own: Vec<&OsStr> = match here {
@@ -733,13 +887,10 @@ impl Run<'_> {
                         .filter_map(|k| k.file_name().map(OsString::from)),
                 )
                 .collect();
-            let mut projected: Vec<OsString> = names
-                .iter()
-                .filter(|n| !own.contains(&n.as_os_str()))
-                .cloned()
-                .collect();
-            projected.extend(arriving.iter().cloned());
-            if let Some(other) = companions::arrival_conflict(new, &carried, &projected) {
+            // Its names there once everything of its group arrives, its own
+            // names left out: as strict as renaming item by item.
+            let gone = |i: usize| names.get(i).is_some_and(|n| own.contains(&n.as_os_str()));
+            if let Some(other) = there.arriving.arrival_conflict(new, &carried, &gone) {
                 return Ok(Some(format!(
                     "{} there would share an XMP sidecar with it now",
                     other.to_string_lossy()
@@ -750,9 +901,7 @@ impl Run<'_> {
                     continue;
                 };
                 let mine = |n: &OsStr| here && m.source.file_name() == Some(n);
-                let listed = names
-                    .iter()
-                    .any(|n| !mine(n) && (n == name || item.rules.key(n) == item.rules.key(name)));
+                let listed = there.alike(item.rules, name).into_iter().any(|n| !mine(n));
                 let found = match self.disk.entry(&dir.join(name)) {
                     Err(FsError::NotFound) => false,
                     Ok(e) => !(here && e.id == m.id),
@@ -762,7 +911,7 @@ impl Run<'_> {
                     return Ok(Some(format!("{} is there now", name.to_string_lossy())));
                 }
             }
-            if occupied(w, self.folders, to, dir, new, &pre.rows)? {
+            if seen.rows.occupied(w, to, dir, new, &pre.rows)? {
                 return Ok(Some(format!(
                     "a photo of the catalog is named {} there now",
                     new.to_string_lossy()
@@ -804,6 +953,124 @@ impl Run<'_> {
                 journal::set_state(w, id, ItemState::Restoring, Some(super::recover::NOT_BACK))
             })
         }
+    }
+}
+
+/// Journals each of `changed` at its destination as the disk spells it
+/// there ([`Listed::spelled`]).
+fn respell(listed: &Listed<'_>, changed: &mut [Member]) -> Result<(), FsError> {
+    for m in changed {
+        if let (Some(at), Some(id)) = (&m.destination, m.id) {
+            m.destination = Some(listed.spelled(at, id)?);
+        }
+    }
+    Ok(())
+}
+
+/// What the checks of a group's items read of each folder, once, before
+/// any of its steps (#681): its names, as the plan used them, keyed for
+/// what is asked of each item, every name the group's items take there,
+/// and the catalog's photos there. Valid only in the transaction that
+/// journals them, which changes no photo's row.
+struct Seen<'a> {
+    disk: &'a dyn Disk,
+    /// The catalog's photos of each folder asked about.
+    rows: Rows<'a>,
+    /// The names the items take, by folder.
+    arrivals: Vec<(PathBuf, Vec<OsString>)>,
+    folders: RefCell<Vec<(PathBuf, Proof, Rc<SeenFolder>)>>,
+}
+
+/// A folder's names, as [`Seen`] read them.
+struct SeenFolder {
+    /// As listed, or as the plan took them where the drive lists them
+    /// decomposed (#573).
+    listing: Listing,
+    /// Those, then every name the group's items take there.
+    arriving: Listing,
+    /// The listed names by each way of comparing them asked for.
+    keys: RefCell<Vec<(Names, std::collections::HashMap<String, Vec<usize>>)>>,
+}
+
+impl<'a> Seen<'a> {
+    fn new(disk: &'a dyn Disk, folders: &'a Folders, items: &[Item]) -> Self {
+        let mut arrivals: Vec<(PathBuf, Vec<OsString>)> = Vec::new();
+        let taken = items.iter().flat_map(|i| &i.members);
+        for to in taken.filter_map(|m| m.destination.as_deref()) {
+            let (dir, Some(name)) = (parent(to), to.file_name()) else {
+                continue;
+            };
+            match arrivals.iter_mut().find(|(d, _)| d == dir) {
+                Some((_, names)) => names.push(name.to_os_string()),
+                None => arrivals.push((dir.to_path_buf(), vec![name.to_os_string()])),
+            }
+        }
+        Self {
+            disk,
+            rows: Rows::new(folders),
+            arrivals,
+            folders: RefCell::default(),
+        }
+    }
+
+    /// Folder `dir`, its names proven `by`.
+    fn folder(&self, dir: &Path, by: Proof) -> Result<Rc<SeenFolder>> {
+        let found = self
+            .folders
+            .borrow()
+            .iter()
+            .find_map(|(d, p, f)| (d == dir && *p == by).then(|| f.clone()));
+        if let Some(folder) = found {
+            return Ok(folder);
+        }
+        let names = self.disk.list(dir).map_err(anyhow::Error::from)?;
+        let names: Vec<OsString> = match by {
+            Proof::Names => names
+                .iter()
+                .map(|n| super::proof::usable(self.disk, dir, n))
+                .collect(),
+            Proof::Ids => names,
+        };
+        let mut arriving = names.clone();
+        if let Some((_, taken)) = self.arrivals.iter().find(|(d, _)| d == dir) {
+            arriving.extend(taken.iter().cloned());
+        }
+        let folder = Rc::new(SeenFolder {
+            listing: Listing::new(names),
+            arriving: Listing::new(arriving),
+            keys: RefCell::default(),
+        });
+        self.folders
+            .borrow_mut()
+            .push((dir.to_path_buf(), by, folder.clone()));
+        Ok(folder)
+    }
+}
+
+impl SeenFolder {
+    /// The listed names `rules` takes for `name`.
+    fn alike(&self, rules: Names, name: &OsStr) -> Vec<&OsString> {
+        let mut keys = self.keys.borrow_mut();
+        let at = match keys.iter().position(|(r, _)| r.0 == rules.0) {
+            Some(at) => at,
+            None => {
+                let mut by_key: std::collections::HashMap<String, Vec<usize>> = Default::default();
+                for (i, n) in self.listing.names().iter().enumerate() {
+                    by_key.entry(rules.key(n)).or_default().push(i);
+                }
+                keys.push((rules, by_key));
+                keys.len() - 1
+            }
+        };
+        let found = keys[at]
+            .1
+            .get(&rules.key(name))
+            .cloned()
+            .unwrap_or_default();
+        found
+            .into_iter()
+            .map(|i| &self.listing.names()[i])
+            .collect()
     }
 }
 
@@ -879,7 +1146,7 @@ pub(super) fn remove_rows(w: &mut Write<'_>, rows: &[PhotoId], _why: Removal) ->
 pub(super) fn complete(
     w: &mut Write<'_>,
     computer: &str,
-    folders: &Folders,
+    rows: &Rows<'_>,
     disk: &dyn Disk,
     item: &Journalled,
 ) -> Result<()> {
@@ -899,9 +1166,8 @@ pub(super) fn complete(
         }
     };
     let shared_now = match item.members.first() {
-        Some(photo) => shared(
+        Some(photo) => rows.shared(
             w,
-            folders,
             parent(&photo.source),
             photo.source.file_name().unwrap_or_default(),
             photo.id,
@@ -924,7 +1190,7 @@ pub(super) fn complete(
                 }
                 None => Some("it may be in the Trash".into()),
             },
-            Kind::MovePhotos | Kind::RenamePhotos => moved(w, computer, folders, disk, pre, item)?,
+            Kind::MovePhotos | Kind::RenamePhotos => moved(w, computer, rows, disk, pre, item)?,
             Kind::CreateFolder | Kind::RenameFolder | Kind::MoveFolder | Kind::TrashFolder => {
                 Some("not a photo operation".into())
             }
@@ -943,7 +1209,7 @@ pub(super) fn complete(
 fn moved(
     w: &mut Write<'_>,
     computer: &str,
-    folders: &Folders,
+    rows: &Rows<'_>,
     disk: &dyn Disk,
     pre: &super::preconditions::Preconditions,
     item: &Journalled,
@@ -969,7 +1235,7 @@ fn moved(
         return Ok(Some("it has no files".into()));
     };
     let filename = photo.file_name().unwrap_or_default();
-    if occupied(w, folders, to, parent(photo), filename, &pre.rows)? {
+    if rows.occupied(w, to, parent(photo), filename, &pre.rows)? {
         return Ok(Some(format!(
             "a photo of the catalog is named {} there now",
             filename.to_string_lossy()
@@ -980,10 +1246,16 @@ fn moved(
         Ok(to) => to,
         Err(why) => return Ok(Some(why)),
     };
-    w.execute(
+    let changed = w.execute(
         sql!("UPDATE photos SET folder=?, filename=? WHERE id=? OR master_id=?"),
         &[&to, &name, &pre.master, &pre.master],
     )?;
+    // The family the preconditions proved; any other count, `rows` reads
+    // its folders again.
+    match changed == pre.rows.len() {
+        true => rows.moved(&pre.rows, to, name),
+        false => rows.forget(),
+    }
     Ok(None)
 }
 

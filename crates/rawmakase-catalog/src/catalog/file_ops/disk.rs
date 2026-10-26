@@ -1,15 +1,23 @@
 //! The file system as planning, execution and recovery see it: exactly the
 //! [`fsops`] calls they make, behind one trait, so tests inject failures
 //! and crashes at any step and record which folders were synced. The real
-//! one is [`Real`]; nothing else implements it outside tests.
+//! one is [`Real`]; outside tests, only [`Listed`], which reads each
+//! folder's listing once from another, wraps it.
 use crate::storage::Identity;
 use crate::storage::fsops::{self, ContentHash, CopyError, Entry, FileId, FsError};
-use std::ffi::OsString;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 pub(super) trait Disk {
     fn entry(&self, path: &Path) -> Result<Entry, FsError>;
     fn list(&self, dir: &Path) -> Result<Vec<OsString>, FsError>;
+    /// Whether `dir`'s listing has exactly `name`.
+    fn lists(&self, dir: &Path, name: &OsStr) -> Result<bool, FsError> {
+        Ok(self.list(dir)?.iter().any(|n| n == name))
+    }
     fn identity(&self, path: &Path) -> anyhow::Result<Identity>;
     fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError>;
     fn create_dir(&self, path: &Path) -> Result<(), FsError>;
@@ -158,10 +166,10 @@ pub(super) fn presence(disk: &dyn Disk, path: &Path, id: fsops::FileId) -> Prese
     let (dir, Some(name)) = (parent(path), path.file_name()) else {
         return Presence::Unknown;
     };
-    let Ok(names) = disk.list(dir) else {
+    let Ok(listed) = disk.lists(dir, name) else {
         return Presence::Unknown;
     };
-    if names.iter().any(|n| n == name) {
+    if listed {
         return match disk.entry(path) {
             Ok(e) if e.id == id => Presence::Here,
             _ => Presence::Unknown,
@@ -201,15 +209,168 @@ pub(super) fn spelled(disk: &dyn Disk, path: &Path, id: fsops::FileId) -> Result
     let dir = parent(path);
     let wanted = super::super::sidecar::caseless(path.file_name().unwrap_or_default());
     let names = disk.list(dir)?;
-    let mut spelled = names.iter().filter(|n| {
-        super::super::sidecar::caseless(n) == wanted
-            && disk.entry(&dir.join(n)).is_ok_and(|e| e.id == id)
-    });
+    let alike = names
+        .iter()
+        .filter(|n| super::super::sidecar::caseless(n) == wanted)
+        .map(OsString::as_os_str);
+    one_spelling(disk, dir, alike, id)
+}
+
+/// The one name of `alike` (names in folder `dir`) that is file object
+/// `id`, as [`spelled`] decides it.
+fn one_spelling<'n>(
+    disk: &dyn Disk,
+    dir: &Path,
+    alike: impl Iterator<Item = &'n OsStr>,
+    id: fsops::FileId,
+) -> Result<PathBuf, FsError> {
+    let mut spelled = alike.filter(|n| disk.entry(&dir.join(n)).is_ok_and(|e| e.id == id));
     match (spelled.next(), spelled.next()) {
         (Some(name), None) => Ok(dir.join(name)),
         _ => Err(FsError::Io(std::io::Error::other(
             "its name in its folder can't be told",
         ))),
+    }
+}
+
+/// [`Disk`] with each folder listed once while nothing is changed through
+/// it: what a group of items reads before its first step, or after its
+/// last (#681), where listing a large folder for each of its files made a
+/// run quadratic. Any call that may change a folder's names forgets every
+/// listing, so a step's own change is always read afresh; a change made by
+/// something else meanwhile is read as a listing per item would read it
+/// later: the names it decides on are looked up as well.
+pub(super) struct Listed<'a> {
+    disk: &'a dyn Disk,
+    listings: RefCell<HashMap<PathBuf, Rc<Listing>>>,
+}
+
+/// A folder's names, with those `sidecar::caseless` takes for one another
+/// grouped once.
+struct Listing {
+    names: Vec<OsString>,
+    caseless: HashMap<String, Vec<usize>>,
+}
+
+impl<'a> Listed<'a> {
+    pub fn new(disk: &'a dyn Disk) -> Self {
+        Self {
+            disk,
+            listings: RefCell::default(),
+        }
+    }
+
+    fn listing(&self, dir: &Path) -> Result<Rc<Listing>, FsError> {
+        if let Some(listing) = self.listings.borrow().get(dir) {
+            return Ok(listing.clone());
+        }
+        let names = self.disk.list(dir)?;
+        let mut caseless: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, name) in names.iter().enumerate() {
+            caseless
+                .entry(super::super::sidecar::caseless(name))
+                .or_default()
+                .push(i);
+        }
+        let listing = Rc::new(Listing { names, caseless });
+        self.listings
+            .borrow_mut()
+            .insert(dir.to_path_buf(), listing.clone());
+        Ok(listing)
+    }
+
+    /// Forgets every listing, after `result` of a call that may have
+    /// changed a folder's names (failed or not).
+    fn changed<T>(&self, result: T) -> T {
+        self.listings.borrow_mut().clear();
+        result
+    }
+
+    /// [`spelled`], from the listing read once.
+    pub fn spelled(&self, path: &Path, id: FileId) -> Result<PathBuf, FsError> {
+        let dir = parent(path);
+        let listing = self.listing(dir)?;
+        let wanted = super::super::sidecar::caseless(path.file_name().unwrap_or_default());
+        let alike = listing
+            .caseless
+            .get(&wanted)
+            .into_iter()
+            .flatten()
+            .map(|&i| listing.names[i].as_os_str());
+        one_spelling(self, dir, alike, id)
+    }
+}
+
+impl Disk for Listed<'_> {
+    fn entry(&self, path: &Path) -> Result<Entry, FsError> {
+        self.disk.entry(path)
+    }
+    fn list(&self, dir: &Path) -> Result<Vec<OsString>, FsError> {
+        Ok(self.listing(dir)?.names.clone())
+    }
+    fn lists(&self, dir: &Path, name: &OsStr) -> Result<bool, FsError> {
+        let listing = self.listing(dir)?;
+        let alike = listing.caseless.get(&super::super::sidecar::caseless(name));
+        Ok(alike.is_some_and(|at| at.iter().any(|&i| listing.names[i] == name)))
+    }
+    fn identity(&self, path: &Path) -> anyhow::Result<Identity> {
+        self.disk.identity(path)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.rename(from, to))
+    }
+    fn create_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.create_dir(path))
+    }
+    fn sync_dir(&self, dir: &Path) -> Result<(), FsError> {
+        self.disk.sync_dir(dir)
+    }
+    fn canonical(&self, path: &Path) -> Result<PathBuf, FsError> {
+        self.disk.canonical(path)
+    }
+    fn volume_facts(&self, path: &Path) -> Result<fsops::VolumeFacts, FsError> {
+        self.disk.volume_facts(path)
+    }
+    fn create_file(&self, path: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.create_file(path))
+    }
+    fn copy_into(
+        &self,
+        from: &Path,
+        to: &Path,
+        to_id: Option<FileId>,
+        go_on: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<ContentHash, CopyError> {
+        self.changed(self.disk.copy_into(from, to, to_id, go_on))
+    }
+    fn sync_file(&self, path: &Path) -> Result<(), FsError> {
+        self.disk.sync_file(path)
+    }
+    // Extras and times may be kept in files of their own (macOS's `._name`
+    // on FAT and exFAT).
+    fn copy_extras(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.copy_extras(from, to))
+    }
+    fn copy_times(&self, from: &Path, to: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.copy_times(from, to))
+    }
+    fn extras(&self, path: &Path) -> Result<ContentHash, FsError> {
+        self.disk.extras(path)
+    }
+    fn hash(&self, path: &Path) -> Result<ContentHash, FsError> {
+        self.disk.hash(path)
+    }
+    fn hash_prefix(&self, path: &Path, len: u64) -> Result<ContentHash, FsError> {
+        self.disk.hash_prefix(path, len)
+    }
+    fn created(&self, path: &Path) -> Result<std::time::SystemTime, FsError> {
+        self.disk.created(path)
+    }
+    fn remove_file(&self, path: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.remove_file(path))
+    }
+    fn remove_dir(&self, path: &Path) -> Result<(), FsError> {
+        self.changed(self.disk.remove_dir(path))
     }
 }
 

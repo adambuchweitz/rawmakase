@@ -638,6 +638,8 @@ mod rename_tests;
 #[cfg(test)]
 mod rules_tests;
 #[cfg(test)]
+mod run_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tree_copy_tests;

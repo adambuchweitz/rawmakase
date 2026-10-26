@@ -58,7 +58,7 @@ use super::disk::{Disk, Presence, Real, parent, presence};
 use super::execute::{complete, restore};
 use super::folder::{self, FolderState};
 use super::journal::{self, Item, ItemState, Kind, Member, MemberState, OperationId, Subject};
-use super::plan::{Folders, shared};
+use super::plan::{Folders, Rows, shared};
 use super::{FileOpError, ItemOutcome, ItemResult, KeptOriginal, Trash};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -337,13 +337,13 @@ fn decide(
         {
             catalog
                 .db
-                .write_immediate(|w| complete(w, computer, folders, disk, item))
+                .write_immediate(|w| complete(w, computer, &Rows::new(folders), disk, item))
         }
         // Rule 4.
         Kind::TrashPhotos if item.members.iter().all(|m| m.state == MemberState::Trashed) => {
             catalog
                 .db
-                .write_immediate(|w| complete(w, computer, folders, disk, item))
+                .write_immediate(|w| complete(w, computer, &Rows::new(folders), disk, item))
         }
         Kind::TrashPhotos => unfinished(catalog, "it may be in the Trash"),
         // Rule 6.

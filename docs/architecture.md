@@ -269,9 +269,12 @@ inject a temporary file, without changing the process-wide environment.
   Trash goes in one Trash call, only while its whole tree is exactly as the
   user was asked about (`file_ops::tree_trash`), and its subtree's rows go
   only with the receipt, the folder gone from its path and, where it can be
-  read, the trashed folder proven the one planned. Every disk step is journalled, after its folders
-  are synced, before the next, and recovery decides whatever a crash left from
-  the journal and the disk, putting back only what it proves. One process at a
+  read, the trashed folder proven the one planned. Every disk step is journalled only
+  after its folders are synced, and before anything relies on it: one step at a
+  time, but for a rename or a move within a volume, whose items go in groups
+  (each folder synced once for a group's renames, then the group journalled and
+  completed, #681). Recovery decides whatever a crash left from the journal and
+  the disk, putting back only what it proves. One process at a
   time changes a catalog's files, under an OS lock on a file beside the
   catalog named after its canonical path; catalogs on network volumes or with
   several hard links are refused. Each item's preconditions (its family's

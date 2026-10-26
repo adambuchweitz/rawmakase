@@ -470,14 +470,7 @@ pub(super) fn shared(
     file: Option<FileId>,
     family: &[PhotoId],
 ) -> anyhow::Result<bool> {
-    let name = caseless(filename);
-    for folder in folders.over(dir) {
-        let masters = Masters::read(db, folders, folder, dir, file.is_some())?;
-        if masters.share(&name, file, family) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Rows::new(folders).shared(db, dir, filename, file, family)
 }
 
 /// The masters of a catalog folder over a directory, by name (by
@@ -544,32 +537,203 @@ pub(super) fn occupied(
     filename: &OsStr,
     family: &[PhotoId],
 ) -> anyhow::Result<bool> {
-    row! {
-        struct Named {
-            id: PhotoId,
-            filename: String,
+    Rows::new(folders).occupied(db, to, dir, filename, family)
+}
+
+/// The catalog's photos of the folders [`shared`] and [`occupied`] ask
+/// about, each folder read once and then kept as [`Rows::moved`] is told
+/// its photos change (#681): so a group of items is checked in one
+/// transaction against exactly what reading each folder again would find,
+/// without reading it for each. Valid only within one transaction that
+/// changes photos' rows only through `moved`.
+pub(super) struct Rows<'f> {
+    folders: &'f Folders,
+    read: std::cell::RefCell<HashMap<FolderId, FolderRows>>,
+}
+
+/// A catalog folder's photos, as [`Rows`] keeps them.
+#[derive(Default)]
+struct FolderRows {
+    /// Each photo's filename, and whether it is a master.
+    photos: HashMap<PhotoId, (String, bool)>,
+    /// The photos by filename, by `sidecar::caseless`.
+    by_name: HashMap<String, Vec<PhotoId>>,
+    /// The masters by the file object each name is in a directory, for
+    /// each directory asked about.
+    by_file: HashMap<PathBuf, HashMap<FileId, Vec<PhotoId>>>,
+}
+
+impl FolderRows {
+    fn add(&mut self, folders: &Folders, id: PhotoId, filename: String, master: bool) {
+        self.by_name
+            .entry(caseless(OsStr::new(&filename)))
+            .or_default()
+            .push(id);
+        if master {
+            for (dir, files) in &mut self.by_file {
+                if let Some(f) = folders.file_at(&dir.join(&filename)) {
+                    files.entry(f).or_default().push(id);
+                }
+            }
+        }
+        self.photos.insert(id, (filename, master));
+    }
+
+    /// Takes photo `id` out, returning whether it is a master.
+    fn remove(&mut self, folders: &Folders, id: PhotoId) -> Option<bool> {
+        let (filename, master) = self.photos.remove(&id)?;
+        let unlist = |ids: &mut Vec<PhotoId>| ids.retain(|p| *p != id);
+        if let Some(ids) = self.by_name.get_mut(&caseless(OsStr::new(&filename))) {
+            unlist(ids);
+        }
+        for (dir, files) in &mut self.by_file {
+            let at = folders.file_at(&dir.join(&filename));
+            if let Some(ids) = at.and_then(|f| files.get_mut(&f)) {
+                unlist(ids);
+            }
+        }
+        Some(master)
+    }
+}
+
+impl<'f> Rows<'f> {
+    pub fn new(folders: &'f Folders) -> Self {
+        Self {
+            folders,
+            read: Default::default(),
         }
     }
-    let name = caseless(filename);
-    let mut over = folders.over(dir);
-    if let Some(to) = to
-        && !over.contains(&to)
-    {
-        over.push(to);
-    }
-    for folder in over {
-        let photos: Vec<Named> = db.read(
-            sql!("SELECT id, filename FROM photos WHERE folder=?"),
-            &[&folder],
-        )?;
-        if photos
-            .iter()
-            .any(|p| !family.contains(&p.id) && caseless(OsStr::new(&p.filename)) == name)
+
+    /// Runs `f` on catalog folder `folder`'s photos, read when first asked
+    /// for, and with its masters by file object in `dir` when asked.
+    fn with<R>(
+        &self,
+        db: &impl Reads,
+        folder: FolderId,
+        files_in: Option<&Path>,
+        f: impl FnOnce(&FolderRows) -> R,
+    ) -> anyhow::Result<R> {
+        row! {
+            struct Named {
+                id: PhotoId,
+                filename: String,
+                master: bool,
+            }
+        }
+        let mut read = self.read.borrow_mut();
+        let rows = match read.entry(folder) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let named: Vec<Named> = db.read(
+                    sql!(
+                        "SELECT id, filename, master_id IS NULL AS master FROM photos
+                         WHERE folder=?"
+                    ),
+                    &[&folder],
+                )?;
+                let mut rows = FolderRows::default();
+                for p in named {
+                    rows.add(self.folders, p.id, p.filename, p.master);
+                }
+                e.insert(rows)
+            }
+        };
+        if let Some(dir) = files_in
+            && !rows.by_file.contains_key(dir)
         {
-            return Ok(true);
+            let mut files: HashMap<FileId, Vec<PhotoId>> = HashMap::new();
+            for (id, (filename, master)) in &rows.photos {
+                if let (true, Some(f)) = (*master, self.folders.file_at(&dir.join(filename))) {
+                    files.entry(f).or_default().push(*id);
+                }
+            }
+            rows.by_file.insert(dir.to_path_buf(), files);
+        }
+        Ok(f(rows))
+    }
+
+    /// [`shared`].
+    pub fn shared(
+        &self,
+        db: &impl Reads,
+        dir: &Path,
+        filename: &OsStr,
+        file: Option<FileId>,
+        family: &[PhotoId],
+    ) -> anyhow::Result<bool> {
+        let name = caseless(filename);
+        for folder in self.folders.over(dir) {
+            let found = self.with(db, folder, file.map(|_| dir), |rows| {
+                let master = |p: &&PhotoId| rows.photos.get(p).is_some_and(|(_, m)| *m);
+                let named = rows.by_name.get(&name).into_iter().flatten().filter(master);
+                let same = file
+                    .and_then(|f| rows.by_file.get(dir)?.get(&f))
+                    .into_iter()
+                    .flatten();
+                named.chain(same).any(|p| !family.contains(p))
+            })?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`occupied`].
+    pub fn occupied(
+        &self,
+        db: &impl Reads,
+        to: Option<FolderId>,
+        dir: &Path,
+        filename: &OsStr,
+        family: &[PhotoId],
+    ) -> anyhow::Result<bool> {
+        let name = caseless(filename);
+        let mut over = self.folders.over(dir);
+        if let Some(to) = to
+            && !over.contains(&to)
+        {
+            over.push(to);
+        }
+        for folder in over {
+            let found = self.with(db, folder, None, |rows| {
+                rows.by_name
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                    .any(|p| !family.contains(p))
+            })?;
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Forgets every folder read, to read them again when next asked.
+    pub fn forget(&self) {
+        self.read.borrow_mut().clear();
+    }
+
+    /// Photos `ids` are in catalog folder `to` now, named `filename`.
+    pub fn moved(&self, ids: &[PhotoId], to: FolderId, filename: &str) {
+        let mut read = self.read.borrow_mut();
+        let mut masters = Vec::new();
+        for &id in ids {
+            let master = read
+                .values_mut()
+                .find_map(|rows| rows.remove(self.folders, id));
+            masters.push((id, master));
+        }
+        // Without knowing which is the master, the folder is read again.
+        if masters.iter().any(|(_, m)| m.is_none()) {
+            read.remove(&to);
+        } else if let Some(rows) = read.get_mut(&to) {
+            for (id, master) in masters {
+                rows.add(self.folders, id, filename.to_string(), master == Some(true));
+            }
         }
     }
-    Ok(false)
 }
 
 /// Where the files go, checked once.

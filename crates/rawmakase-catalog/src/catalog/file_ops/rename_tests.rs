@@ -654,6 +654,8 @@ fn every_fault_at_every_disk_step_of_a_rename_ends_proven() {
         (Op::Sync, counting.count(Op::Sync)),
     ];
     assert_eq!(steps[0].1, 3);
+    // Both items go in one group: their folder synced once (#681).
+    assert_eq!(steps[1].1, 1);
     let mut runs = 0;
     for (at, count) in steps {
         for nth in 0..count {
@@ -682,7 +684,7 @@ fn every_fault_at_every_disk_step_of_a_rename_ends_proven() {
             }
         }
     }
-    assert!(runs >= 18);
+    assert_eq!(runs, 3 * (3 + 1));
 }
 
 #[test]

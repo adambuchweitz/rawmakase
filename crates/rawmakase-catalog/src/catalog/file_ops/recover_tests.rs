@@ -14,7 +14,9 @@ use crate::catalog::Catalog;
 use crate::storage::Identity;
 use crate::storage::fsops;
 use anyhow::Result;
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
+use std::rc::Rc;
 
 /// The files and rows a scenario starts from.
 pub(super) struct Before {
@@ -221,6 +223,8 @@ fn every_fault_at_every_disk_step_of_a_move_ends_proven() {
         (Op::Sync, counting.count(Op::Sync)),
     ];
     assert_eq!(steps[0].1, 3);
+    // Both items go in one group: their folder and sub synced once (#681).
+    assert_eq!(steps[1].1, 2);
     let mut runs = 0;
     for (at, count) in steps {
         for nth in 0..count {
@@ -246,7 +250,7 @@ fn every_fault_at_every_disk_step_of_a_move_ends_proven() {
             }
         }
     }
-    assert!(runs >= 18);
+    assert_eq!(runs, 3 * (3 + 2));
 }
 
 #[test]
@@ -366,25 +370,71 @@ fn the_journal_moves_past_a_step_only_once_its_folders_are_synced() -> Result<()
         first.destination.as_ref().is_some_and(|d| d.is_file()),
         "the rename itself happened"
     );
-    // Every rename's folders are synced before the journal records it.
-    let disk = Faulty::default();
+    // Every rename's folders are synced before the journal records it:
+    // whenever the journal is read between two disk calls, each member it
+    // has moved was renamed by an earlier call, and both its folders synced
+    // after that. Renames are grouped (#681), so this is the order that
+    // matters, not one sync right after each rename.
     let mut fx = move_files();
-    let op = move_op(&fx);
-    let _ = fx.run(op, &NoTrash, &disk);
-    let calls = disk.calls.borrow();
-    for (i, c) in calls.iter().enumerate() {
-        if let tests::Call::Rename(from, to) = c {
-            let syncs: Vec<_> = calls[i + 1..]
-                .iter()
-                .take(2)
-                .filter_map(|c| match c {
-                    tests::Call::Sync(d) => Some(d.clone()),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(syncs, [from.parent().unwrap(), to.parent().unwrap()]);
+    let catalog = fx.catalog.clone();
+    let calls: Rc<RefCell<Vec<tests::Call>>> = Rc::default();
+    let unsynced: Rc<RefCell<Vec<String>>> = Rc::default();
+    let check = {
+        let (calls, unsynced) = (Rc::clone(&calls), Rc::clone(&unsynced));
+        move || {
+            let db = rusqlite::Connection::open(&catalog).unwrap();
+            let mut moved = db
+                .prepare(
+                    "SELECT source, destination FROM file_operation_members WHERE state='moved'",
+                )
+                .unwrap();
+            let moved = moved
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(Result::unwrap);
+            let calls = calls.borrow();
+            for (from, to) in moved {
+                let (from, to) = (std::path::PathBuf::from(from), std::path::PathBuf::from(to));
+                let renamed = calls
+                    .iter()
+                    .position(|c| *c == tests::Call::Rename(from.clone(), to.clone()));
+                let synced = |dir: &std::path::Path| {
+                    renamed.is_some_and(|r| {
+                        calls[r + 1..]
+                            .iter()
+                            .any(|c| *c == tests::Call::Sync(dir.to_path_buf()))
+                    })
+                };
+                if !(synced(from.parent().unwrap()) && synced(to.parent().unwrap())) {
+                    unsynced.borrow_mut().push(format!(
+                        "{} after {} calls",
+                        to.display(),
+                        calls.len()
+                    ));
+                }
+            }
         }
-    }
+    };
+    let watched = check.clone();
+    let recorded = Rc::clone(&calls);
+    let disk = Faulty {
+        watch: Some(Box::new(move |call: &tests::Call| {
+            watched();
+            recorded.borrow_mut().push(call.clone());
+        })),
+        ..Faulty::default()
+    };
+    let op = move_op(&fx);
+    let outcome = fx.run(op, &NoTrash, &disk);
+    check();
+    assert!(
+        outcome
+            .items
+            .iter()
+            .all(|i| matches!(i.result, ItemResult::Moved { .. })),
+        "{outcome:?}"
+    );
+    assert!(unsynced.borrow().is_empty(), "{:?}", unsynced.borrow());
     Ok(())
 }
 
