@@ -41,6 +41,20 @@ pub(in crate::catalog) const RASTER_MASKS: i64 = 2;
 #[cfg(test)]
 pub(in crate::catalog) const BEFORE_ONE_ENGINE: i64 = 2;
 
+#[cfg(test)]
+thread_local! {
+    /// The writes this thread committed, for tests that count what a run
+    /// makes durable.
+    static COMMITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many writes this thread has committed through [`Db::write`] and
+/// [`Db::write_immediate`].
+#[cfg(test)]
+pub(in crate::catalog) fn commits() -> usize {
+    COMMITS.with(std::cell::Cell::get)
+}
+
 /// Whether a release that opens versions up to `newest` opens a catalog of
 /// `version`: this one with [`VERSION`], an earlier one with its own (the check is
 /// the same in every release).
@@ -233,6 +247,8 @@ impl Db {
                 let tx = db.transaction_with_behavior(behavior)?;
                 let result = f(&mut Write { db: &tx })?;
                 tx.commit()?;
+                #[cfg(test)]
+                COMMITS.with(|c| c.set(c.get() + 1));
                 Ok(result)
             }
         }
