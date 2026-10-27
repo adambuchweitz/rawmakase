@@ -854,7 +854,7 @@ impl Run<'_> {
         };
         let stays: Vec<OsString> = kept
             .map(OsString::from)
-            .chain(carried.iter().cloned().filter(|_| here))
+            .chain(carried.iter().filter(|_| here).cloned())
             .collect();
         let left = seen
             .companions(from, pre.proofs.originals, old, &same_file)?
@@ -1116,10 +1116,13 @@ struct Tracked {
 /// Indices of a folder's names, by a key of each.
 type Keyed = HashMap<String, Vec<usize>>;
 
+/// A folder, with how its names are proven.
+type Folder = (PathBuf, Proof);
+
 /// The folders a run's checks read, each as [`Tracked`], by how its names
 /// are proven.
 #[derive(Default)]
-pub(super) struct Tracking(RefCell<Vec<((PathBuf, Proof), Tracked)>>);
+pub(super) struct Tracking(RefCell<Vec<(Folder, Tracked)>>);
 
 impl Tracked {
     fn new() -> Self {
@@ -1214,7 +1217,7 @@ struct Seen<'a> {
     /// The names the items take, by folder.
     arrivals: Vec<(PathBuf, Vec<OsString>)>,
     /// The folders listed so far, with where the arrivals there are.
-    read: RefCell<Vec<((PathBuf, Proof), HashSet<usize>)>>,
+    read: RefCell<Vec<(Folder, HashSet<usize>)>>,
     /// The names the items journalled to go so far leave, by folder: gone
     /// for the items after them, as they were item by item.
     departed: RefCell<HashSet<(PathBuf, OsString)>>,
