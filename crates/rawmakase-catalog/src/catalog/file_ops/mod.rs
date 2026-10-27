@@ -128,6 +128,16 @@ pub enum FileOp {
         to_root: RootId,
         parent: String,
     },
+    /// Moves root folder `root` into logical folder `parent` of another
+    /// root, `to_root` (#586), with every catalog folder of it: on its
+    /// drive by one rename, onto another by a copy of its whole tree, as
+    /// [`Self::MoveFolder`] moves a folder. Its folders join `to_root`,
+    /// keeping their ids, and `root` leaves the catalog's roots.
+    MoveRoot {
+        root: RootId,
+        to_root: RootId,
+        parent: String,
+    },
     /// Puts the folder at logical path `folder` of `root` in the system
     /// Trash, with everything in it; then the catalog's folders of its
     /// subtree leave the catalog with their photos (virtual copies
@@ -247,7 +257,7 @@ impl fmt::Display for Refusal {
             ),
             Self::CompanionName(n) => write!(f, "{n} can't be renamed to match it."),
             Self::FileIdsUnproven => f.write_str(
-                "Moving photos to or from this kind of drive (network drives other than SMB shares on a Mac, and others) isn't available yet. Copy them in Finder, then use Synchronize Folder.",
+                "Moving photos to or from this kind of drive (network drives other than SMB shares on a Mac or mounted as CIFS on Linux, and others) isn't available yet. Copy them in Finder, then use Synchronize Folder.",
             ),
         }
     }
@@ -330,8 +340,8 @@ pub struct Across {
     pub available: u64,
     /// How many of what it copies keep their originals where they are:
     /// photo files, with their companions, or the folder, which counts
-    /// once. They are on an SMB share, where macOS has no Trash; nothing is
-    /// deleted instead.
+    /// once. They are on an SMB share, which has no Trash RAWmakase uses;
+    /// nothing is deleted instead.
     pub originals_stay: usize,
 }
 
@@ -629,6 +639,8 @@ mod lock_tests;
 mod move_folder_tests;
 #[cfg(test)]
 mod move_root_tests;
+#[cfg(test)]
+mod nest_root_tests;
 #[cfg(test)]
 mod plan_tests;
 #[cfg(test)]

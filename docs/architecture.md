@@ -269,10 +269,14 @@ inject a temporary file, without changing the process-wide environment.
   Trash goes in one Trash call, only while its whole tree is exactly as the
   user was asked about (`file_ops::tree_trash`), and its subtree's rows go
   only with the receipt, the folder gone from its path and, where it can be
-  read, the trashed folder proven the one planned. Every disk step is journalled only
-  after its folders are synced, and before anything relies on it: one step at a
-  time, but for a rename or a move within a volume, whose items go in groups
-  (each folder synced once for a group's renames, then the group journalled and
+  read, the trashed folder proven the one planned. A root folder moved into
+  another root moves as a folder does, and leaves the catalog's roots, with
+  its locations on every computer, in the transaction that re-keys its
+  folders; it is journalled as its own kind (`move_root`), which earlier
+  releases fail closed on. Every disk step is journalled only after its
+  folders are synced, and before anything relies on it: one step at a time,
+  but for a rename or a move within a volume, whose items go in groups (each
+  folder synced once for a group's renames, then the group journalled and
   completed, #681). Recovery decides whatever a crash left from the journal and
   the disk, putting back only what it proves. One process at a
   time changes a catalog's files, under an OS lock on a file beside the
@@ -310,8 +314,11 @@ The desktop renderer creates it on its worker thread. Headless UI tests and the
 legacy `worker::renderer` entry point remain CPU-only. Domain color processing,
 RAW development and exports use the existing CPU implementation.
 
-`develop::gpu` uses portable WGSL compute through wgpu: Metal on macOS and Vulkan
-on supported Linux drivers, including NVIDIA and AMD. On the desktop it shares the
+`develop::gpu` uses portable WGSL compute through wgpu: Metal on macOS, Vulkan
+on supported Linux drivers, including NVIDIA and AMD, and DirectX 12 on Windows.
+Windows leaves Vulkan out unless `WGPU_BACKEND` asks for it, because an Intel
+Vulkan driver crashed the app at launch where DirectX 12 worked (#623); the UI
+and a standalone processor share that choice (`gpu::backends`). On the desktop it shares the
 UI's wgpu device (eframe's), which the app creates with the storage limits previews
 need (`gpu::required_limits`) and a high-performance adapter. On Linux the window's
 adapter is the first GPU the system lists instead: the display's GPU, or the discrete

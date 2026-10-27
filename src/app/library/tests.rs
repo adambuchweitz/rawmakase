@@ -571,8 +571,8 @@ fn a_folder_s_menu_turns_subfolders_off_and_its_count_follows() {
         path: PathBuf::from("/missing").join(relative),
         count,
     };
-    root.insert(&folder(1, "", 2));
-    root.insert(&folder(2, "day1", 3));
+    root.insert(&folder(1, "", 2), &HashMap::new());
+    root.insert(&folder(2, "day1", 3), &HashMap::new());
     root.finish();
     let (labels, action) = tree_menu(&root, "Show Photos in Subfolders", true);
     assert!(
@@ -686,13 +686,16 @@ fn batched_availability_distinguishes_files_directories_and_missing_paths() -> R
 fn hierarchy_includes_unregistered_parents_and_descendant_counts() {
     let mut root = FolderNode::root(RootId(1), "Photos".into(), "/old".into());
     for (id, relative, count) in [(10, "2026/09/Trip/", 2), (11, "2026/10/", 3)] {
-        root.insert(&Folder {
-            id: FolderId(id),
-            root: RootId(1),
-            relative: relative.into(),
-            path: PathBuf::from("/old").join(relative),
-            count,
-        });
+        root.insert(
+            &Folder {
+                id: FolderId(id),
+                root: RootId(1),
+                relative: relative.into(),
+                path: PathBuf::from("/old").join(relative),
+                count,
+            },
+            &HashMap::new(),
+        );
     }
     root.finish();
     assert_eq!(root.count, 5);
@@ -2786,7 +2789,7 @@ fn the_folders_panel_groups_roots_by_the_drive_found_for_them() -> Result<()> {
     };
     frame(&mut library);
     library.volumes.wait();
-    let root = library.root_paths().remove(0);
+    let root = library.anchors().remove(0).2;
     let image = crate::platform::volume::Volume {
         name: "RMK590".into(),
         mount: Some(root.parent().unwrap().into()),
@@ -2795,6 +2798,88 @@ fn the_folders_panel_groups_roots_by_the_drive_found_for_them() -> Result<()> {
         .volumes
         .set_seen(volumes::Seen::from([(root, image.clone())]));
     assert_eq!(frame(&mut library), vec![image]);
+    Ok(())
+}
+
+#[test]
+fn a_folder_located_on_another_drive_shows_under_that_drive() -> Result<()> {
+    // #678: a folder holding only folders, located on another drive, showed
+    // under its root's drive, at the path below its root.
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().join("disk/2026");
+    let card = |folder: &std::path::Path| -> Result<()> {
+        let card = folder.join("RAW/Card 1");
+        std::fs::create_dir_all(&card)?;
+        std::fs::write(card.join("a.RAF"), b"synthetic raw")?;
+        Ok(())
+    };
+    card(&root.join("Wedding"))?;
+    card(&root.join("Party"))?;
+    let moved = directory.path().join("other/Wedding");
+    card(&moved)?;
+    let party = directory.path().join("disk/Elsewhere/Party");
+    card(&party)?;
+    let path = directory.path().join("library.rawmakase");
+    let mut catalog = Catalog::create(&path)?;
+    catalog.add_folder(&root)?;
+    let id = catalog.roots()?[0].0;
+    catalog.relink_folder_at(id, "Wedding", &moved, crate::catalog::Overrides::Keep)?;
+    catalog.relink_folder_at(id, "Party", &party, crate::catalog::Overrides::Keep)?;
+    drop(catalog);
+    let mut library = Library::load(&path, egui::Context::default())?;
+    let ctx = library.ctx.clone();
+    let frame = |library: &mut Library| {
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            egui::Panel::left("sidebar").show(ui, |ui| library.sidebar(ui));
+        });
+        output.textures_delta.clear();
+        library.sidebar_trees.clone().expect("the sidebar's trees")
+    };
+    frame(&mut library);
+    library.volumes.wait();
+    let drive = |name: &str, mount: &std::path::Path| crate::platform::volume::Volume {
+        name: name.into(),
+        mount: Some(mount.into()),
+    };
+    let disk = drive("Disk", &directory.path().join("disk"));
+    let other = drive("Other", &directory.path().join("other"));
+    // By the paths the catalog keeps (canonical: /private/var on macOS,
+    // \\?\ on Windows), as the drives are found for them.
+    let at: HashMap<String, PathBuf> = library
+        .anchors()
+        .into_iter()
+        .map(|(_, logical, path)| (logical, path))
+        .collect();
+    let (moved, party) = (at["Wedding"].clone(), at["Party"].clone());
+    library.volumes.set_seen(volumes::Seen::from([
+        (at[""].clone(), disk.clone()),
+        (moved.clone(), other.clone()),
+        (party.clone(), disk.clone()),
+    ]));
+    let trees = frame(&mut library);
+    let shown: Vec<(crate::platform::volume::Volume, Vec<String>)> = trees
+        .drive_trees()
+        .into_iter()
+        .map(|(volume, trees)| (volume, trees.iter().map(|t| t.key.clone()).collect()))
+        .collect();
+    assert_eq!(
+        shown,
+        vec![
+            (disk, vec![format!("root:{id}")]),
+            (other, vec![format!("root:{id}/Wedding")]),
+        ]
+    );
+    let drives = trees.drive_trees();
+    let (root_tree, wedding) = (drives[0].1[0], drives[1].1[0]);
+    assert_eq!(root_tree.children.keys().collect::<Vec<_>>(), vec!["Party"]);
+    // Where it is, down to the folder of folders below it.
+    assert_eq!(wedding.path, moved);
+    assert_eq!(wedding.children["RAW"].path, moved.join("RAW"));
+    assert_eq!(wedding.count, 1);
+    // One elsewhere on its root's drive stays in its root.
+    assert_eq!(root_tree.children["Party"].path, party);
+    // Each drive counts the photos on it.
+    assert_eq!(trees.drive_photos(), vec![1, 1]);
     Ok(())
 }
 
@@ -3296,6 +3381,190 @@ fn a_folder_dropped_on_another_roots_folder_is_dropped_there() {
         Some((RootId(42), "2024/day1".into(), RootId(43), "trips".into()))
     );
 }
+/// A root dragged onto a folder of another root, or that root itself, is
+/// dropped there (#586); onto a folder of its own, nothing is.
+#[test]
+fn a_root_dragged_onto_another_roots_folder_is_dropped_there() {
+    use crate::catalog::FolderId;
+    let ctx = egui::Context::default();
+    let mut root = FolderNode::root(RootId(42), "Photos".into(), "/photos".into());
+    root.folder = Some(FolderId(1));
+    let node = |root: i64, logical: &str, id: u32| FolderNode {
+        key: format!("root:{root}/{logical}"),
+        name: logical.rsplit('/').next().unwrap().into(),
+        in_root: RootId(root),
+        logical: logical.into(),
+        folder: Some(FolderId(id as _)),
+        ..Default::default()
+    };
+    let (own, trips) = (node(42, "2024", 2), node(43, "trips", 3));
+    let mut other = FolderNode::root(RootId(43), "Elsewhere".into(), "/elsewhere".into());
+    other.folder = Some(FolderId(4));
+    let mut expanded = HashSet::new();
+    let mut frame = |events: Vec<egui::Event>| {
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    Vec2::new(360., 240.),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                for n in [&root, &own, &trips, &other] {
+                    actions.push(folder_tree_row(
+                        ui,
+                        n,
+                        0,
+                        &mut expanded,
+                        &Default::default(),
+                        true,
+                    ));
+                }
+            },
+        );
+        output.textures_delta.clear();
+        actions
+    };
+    let press = |at: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+        pos: at,
+        button: egui::PointerButton::Primary,
+        pressed,
+        modifiers: egui::Modifiers::NONE,
+    };
+    let row = |n: usize| egui::pos2(120., 11. + 22. * n as f32);
+    let mut drop_on = |n: usize| {
+        frame(vec![]);
+        frame(vec![egui::Event::PointerMoved(row(0)), press(row(0), true)]);
+        for dy in 1..=12 {
+            frame(vec![egui::Event::PointerMoved(
+                row(0) + Vec2::new(0., dy as f32),
+            )]);
+        }
+        frame(vec![egui::Event::PointerMoved(row(n))]);
+        frame(vec![press(row(n), false)])
+            .into_iter()
+            .flatten()
+            .find_map(|a| match a {
+                TreeAction::DropFolder {
+                    root,
+                    from,
+                    to_root,
+                    to,
+                } => Some((root, from, to_root, to)),
+                _ => None,
+            })
+    };
+    assert_eq!(
+        drop_on(2),
+        Some((RootId(42), String::new(), RootId(43), "trips".into()))
+    );
+    assert_eq!(
+        drop_on(3),
+        Some((RootId(42), String::new(), RootId(43), String::new()))
+    );
+    // Into a folder of its own: no drop.
+    assert_eq!(drop_on(1), None);
+}
+/// A root moved into another root keeps what was selected and unfolded in
+/// it, as that root's folder now.
+#[test]
+fn a_root_moved_into_another_keeps_its_selection_and_unfolded_folders() -> Result<()> {
+    let (_directory, mut library) = library_of(&["a.RAF"])?;
+    library.selected_folders = folder_selection::FolderSelection::one("root:3/day1");
+    library.expanded = ["root:3", "root:3/day1", "root:4/2025", "root:30"]
+        .map(String::from)
+        .into();
+    library.folder_renamed(RootId(3), "", RootId(4), "2025/trip");
+    assert!(library.selected_folders.contains("root:4/2025/trip/day1"));
+    let mut expanded: Vec<_> = library.expanded.iter().cloned().collect();
+    expanded.sort();
+    assert_eq!(
+        expanded,
+        [
+            "root:30",
+            "root:4/2025",
+            "root:4/2025/trip",
+            "root:4/2025/trip/day1"
+        ]
+    );
+    // The root itself selected: the folder it became.
+    library.selected_folders = folder_selection::FolderSelection::one("root:5");
+    library.folder_renamed(RootId(5), "", RootId(4), "trip");
+    assert!(library.selected_folders.contains("root:4/trip"));
+    Ok(())
+}
+/// A folder moved onto a drive that spells it otherwise (composed, on FAT,
+/// exFAT and SMB shares) keeps what was selected and unfolded in it, by the
+/// names the catalog gives its folders once read again.
+#[test]
+fn a_moved_folder_s_selection_follows_the_names_the_catalog_gives_it() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let photos = directory.path().join("photos");
+    for f in ["Cafe\u{301}/day/a.RAF", "Cafe\u{301}/b.RAF", "trips/c.RAF"] {
+        let path = photos.join(f);
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        std::fs::write(&path, b"synthetic raw")?;
+    }
+    let db = directory.path().join("photos.rawmakase");
+    Catalog::create(&db)?.add_folder(&photos)?;
+    let mut library = Library::load(&db, egui::Context::default())?;
+    let root = library.session.roots[0].0;
+    let key = |l: &str| format!("root:{root}/{l}");
+    let day = library
+        .session
+        .folders
+        .iter()
+        .find(|f| f.relative == "Cafe\u{301}/day")
+        .unwrap()
+        .id;
+    library.selected_folders = folder_selection::FolderSelection::one(&key("Cafe\u{301}/day"));
+    library.expanded = [key("Cafe\u{301}"), key("Cafe\u{301}/day"), key("trips")].into();
+    library.folder_renamed(root, "Cafe\u{301}", root, "trips/Cafe\u{301}");
+    // What the move committed: its folders named as the copies are, composed.
+    library.session.catalog.db_for_tests().execute(
+        "UPDATE folder_paths SET path = 'trips/Caf\u{e9}' || substr(path, 6)
+         WHERE path LIKE 'Cafe_%'",
+        [],
+    )?;
+    library.reread_after(&[])?;
+    assert!(
+        library
+            .selected_folders
+            .contains(&key("trips/Caf\u{e9}/day")),
+        "{:?}",
+        library.selected_folders
+    );
+    let mut expanded: Vec<_> = library.expanded.iter().cloned().collect();
+    expanded.sort();
+    assert_eq!(
+        expanded,
+        [
+            key("trips"),
+            key("trips/Caf\u{e9}"),
+            key("trips/Caf\u{e9}/day")
+        ]
+    );
+    assert_eq!(library.filters.folder_scope, Some([day].into()));
+    Ok(())
+}
+/// A root's menu offers Move Folder… (#586), never Rename Folder… or Move
+/// to Trash….
+#[test]
+fn a_root_s_menu_offers_move_folder() {
+    use crate::catalog::FolderId;
+    let mut root = FolderNode::root(RootId(42), "Photos".into(), "/missing".into());
+    root.ids.insert(FolderId(1));
+    let (labels, action) = tree_menu(&root, "Move Folder…", true);
+    assert!(!labels.iter().any(|l| l == "Rename Folder…"), "{labels:?}");
+    assert!(!labels.iter().any(|l| l == "Move to Trash…"), "{labels:?}");
+    assert!(
+        matches!(&action, Some(TreeAction::MoveFolder { root: RootId(42), logical }) if logical.is_empty()),
+        "not asked where it goes: {labels:?}"
+    );
+}
 /// The labels of `node`'s right-click menu, and the action a click on
 /// `choose` gives.
 fn tree_menu(
@@ -3398,13 +3667,16 @@ fn a_folder_s_menu_offers_move_to_trash_and_a_root_s_doesnt() {
 fn a_folder_holding_only_folders_can_be_located() {
     use crate::catalog::FolderId;
     let mut root = FolderNode::root(RootId(42), "2026".into(), "/missing".into());
-    root.insert(&Folder {
-        id: FolderId(1),
-        root: RootId(42),
-        relative: "Wedding/RAW/Card 1".into(),
-        path: PathBuf::from("/missing/Wedding/RAW/Card 1"),
-        count: 3,
-    });
+    root.insert(
+        &Folder {
+            id: FolderId(1),
+            root: RootId(42),
+            relative: "Wedding/RAW/Card 1".into(),
+            path: PathBuf::from("/missing/Wedding/RAW/Card 1"),
+            count: 3,
+        },
+        &HashMap::new(),
+    );
     root.finish();
     let wedding = &root.children["Wedding"];
     assert!(wedding.folder.is_none(), "no catalog folder of its own");

@@ -3,7 +3,8 @@ use crate::app::icons::{self, Icon};
 use crate::app::theme;
 use crate::catalog::{Folder, FolderId, PhotoId, RootId};
 use eframe::egui::{self, Vec2};
-use std::{collections::HashSet, path::PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 #[derive(Default)]
 pub(super) struct FolderNode {
     pub(super) key: String,
@@ -30,16 +31,21 @@ impl FolderNode {
             ..Default::default()
         }
     }
-    pub(super) fn insert(&mut self, f: &Folder) {
+    /// Adds folder `f` to this root's tree, with the folders above it.
+    /// `located` is where folders of the root are apart from it, by logical
+    /// path: a folder above `f` with no catalog folder of its own is there.
+    pub(super) fn insert(&mut self, f: &Folder, located: &HashMap<&str, &Path>) {
         let mut node = self;
         for component in f.relative.split('/').filter(|c| !c.is_empty()) {
             let key = format!("{}/{}", node.key, component);
-            let path = node.path.join(component);
             let in_root = node.in_root;
             let logical = match node.logical.as_str() {
                 "" => component.to_string(),
                 parent => format!("{parent}/{component}"),
             };
+            let path = located
+                .get(logical.as_str())
+                .map_or_else(|| node.path.join(component), |p| p.to_path_buf());
             node = node
                 .children
                 .entry(component.into())
@@ -55,6 +61,25 @@ impl FolderNode {
         node.folder = Some(f.id);
         node.own_count += f.count;
         node.path = f.path.clone();
+    }
+    /// Takes the folder at logical path `logical` below this root out of
+    /// its tree, with the folders in it.
+    pub(super) fn detach(&mut self, logical: &str) -> Option<FolderNode> {
+        let (parent, name) = logical.rsplit_once('/').unwrap_or(("", logical));
+        let mut node = self;
+        for component in parent.split('/').filter(|c| !c.is_empty()) {
+            node = node.children.get_mut(component)?;
+        }
+        node.children.remove(name)
+    }
+    /// The photos of this folder and the folders still in its tree.
+    pub(super) fn photos_in_tree(&self) -> usize {
+        self.own_count
+            + self
+                .children
+                .values()
+                .map(Self::photos_in_tree)
+                .sum::<usize>()
     }
     pub(super) fn finish(&mut self) {
         self.count = self.own_count;
@@ -203,33 +228,33 @@ pub(super) fn folder_tree_row(
 ) -> Option<TreeAction> {
     let palette = theme::palette(ui.ctx());
     use egui::{Align2, FontId, Pos2, Rect, Sense};
-    // Any folder but a root can be dragged onto another folder of its
-    // root, one with no catalog folder of its own (only folders below) too.
+    // Any folder but a root can be renamed, put in the Trash or dragged
+    // onto another folder of its root, one with no catalog folder of its
+    // own (only folders below) too; a root, only dragged onto a folder of
+    // another root, or that root (#586).
     let movable = node.root.is_none();
-    let sense = if movable {
-        Sense::click_and_drag()
-    } else {
-        Sense::click()
-    };
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 22.), sense);
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), 22.),
+        Sense::click_and_drag(),
+    );
     // Named from what is dragged: a row's id is its place in the panel.
-    if movable
-        && let Some(dragged) = super::grid::drag_once(&response, || super::DraggedFolder {
-            root: node.in_root,
-            from: node.logical.clone(),
-        })
-    {
+    if let Some(dragged) = super::grid::drag_once(&response, || super::DraggedFolder {
+        root: node.in_root,
+        from: node.logical.clone(),
+        name: node.name.clone(),
+    }) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
-        dragged_chip(ui, dragged.from.rsplit('/').next().unwrap_or_default());
+        dragged_chip(ui, &dragged.name);
     }
     let painter = ui.painter();
     let active = selected.contains(&node.key);
     let open = expanded.contains(&node.key);
     // Not where it is already, nor itself or a folder in it; any folder of
-    // another root (whose drive the plan checks).
+    // another root (whose drive the plan checks). A root, only those.
     let takes = |d: &super::DraggedFolder| {
         d.root != node.in_root
-            || (node.logical != d.from
+            || (!d.from.is_empty()
+                && node.logical != d.from
                 && !node.logical.starts_with(&format!("{}/", d.from))
                 && node.logical != d.from.rsplit_once('/').map_or("", |(p, _)| p))
     };
@@ -398,7 +423,8 @@ pub(super) fn folder_tree_row(
             });
             ui.close();
         }
-        if movable && menu_item(ui, "Move Folder…", "", true, false) {
+        // A root, into a folder of another root (#586).
+        if menu_item(ui, "Move Folder…", "", true, false) {
             action = Some(TreeAction::MoveFolder {
                 root: node.in_root,
                 logical: node.logical.clone(),
