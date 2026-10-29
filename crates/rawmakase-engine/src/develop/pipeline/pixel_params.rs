@@ -49,13 +49,9 @@ const FIELDS: &[(&str, usize)] = &[
     ("LOCAL_FINE", 1),
     ("SHADOWS", 4),
     ("HIGHLIGHTS", 4),
-    // Positive Shadows' detail and region curves (as SHADOWS), and the regional level's
-    // grid or -1 (see `local_tone::LocalToneMap::lift`).
-    ("LIFT", 8),
     // The photo's global rule at full strength: positive Shadows' and negative
     // Highlights' curves (as SHADOWS), for masks (`local_tone::LocalToneMap::rule`).
     ("RULE", 8),
-    ("LOCAL_REGION", 1),
     ("BASIC", 1),
     ("LEVELS", 3),
     // The measured parametric curve's table, or -1 (see `parametric::ParametricCurve`).
@@ -92,7 +88,7 @@ const FIELDS: &[(&str, usize)] = &[
     // The masks' Contrast pivot.
     ("LOCAL_PIVOT", 1),
     ("LOCAL_FAMILIES", 1),
-    ("LOCAL_KEYS", 3),
+    ("LOCAL_KEYS", 2),
     ("GLOBAL_SH", 2),
 ];
 pub(crate) fn wgsl_prelude() -> String {
@@ -133,7 +129,7 @@ pub(crate) struct PixelParams {
     /// without masks.
     pub(crate) weights: Vec<u32>,
     /// The Shadows/Highlights map's grids, which the shader reads from a buffer of their
-    /// own (`LOCAL_A`, `LOCAL_FINE` and `LOCAL_REGION` offsets into it; Clarity's into `tables`).
+    /// own (`LOCAL_A` and `LOCAL_FINE` offsets into it; Clarity's into `tables`).
     pub(crate) grid: Option<crate::develop::local_tone::MapGrid>,
     /// The recipe as the camera colour reads it (`stage_cache::color_recipe`), when the
     /// develop pass may keep that colour for its samples and reuse it while the stages
@@ -232,10 +228,6 @@ fn set_local(p: &mut PixelParams, local: &LocalToneMap) {
     };
     p.set("LOCAL_A", &[0., grid.cells() as f32, clarity]);
     p.set("LOCAL_FINE", &[grid.fine_at() as f32]);
-    p.set(
-        "LOCAL_REGION",
-        &[grid.region_at().map_or(-1., |at| at as f32)],
-    );
     p.grid = Some(grid);
     let mut curve = |c: Option<&crate::develop::local_tone::Curve>| match c {
         // The table, then its tail (`local_curve` reads it after the 48 columns).
@@ -249,14 +241,9 @@ fn set_local(p: &mut PixelParams, local: &LocalToneMap) {
     };
     let shadows = curve(local.shadows.as_ref());
     let highlights = curve(local.highlights.as_ref());
-    let [detail, region] = match &local.lift {
-        Some([d, r]) => [curve(Some(d)), curve(Some(r))],
-        None => [curve(None), curve(None)],
-    };
     let [rule_s, rule_h] = [curve(local.rule[0].as_ref()), curve(local.rule[1].as_ref())];
     p.set("SHADOWS", &shadows);
     p.set("HIGHLIGHTS", &highlights);
-    p.set("LIFT", &[detail, region].concat());
     p.set("RULE", &[rule_s, rule_h].concat());
 }
 fn set_rgb_table(p: &mut PixelParams, look: Option<&crate::camera_profiles::RgbLook>) {

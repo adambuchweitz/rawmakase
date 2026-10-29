@@ -471,8 +471,7 @@ fn bracket(values: i32, s: f32) -> vec2<f32> {
     let s1 = slider_point(values, j + 1u);
     return vec2(f32(j), (s - s0) / (s1 - s0));
 }
-// local_tone::family: a Shadows (0), Highlights (1), Dehaze (2), Shadows detail (3) or
-// Shadows region (4) gain at slider `s`
+// local_tone::family: a Shadows (0), Highlights (1) or Dehaze (2) gain at slider `s`
 // (layout: `local_tone::gpu_families`).
 fn family(f: u32, s_in: f32, key: f32, base: f32, tail_base: f32) -> f32 {
     if s_in == 0.0 {
@@ -586,22 +585,9 @@ fn local_gain(pos: vec2<f32>, lum: f32, clarity_lum: f32) -> f32 {
         }
         clarity = dot(gains, weights) / dot(weights, vec4(1.0));
     }
-    // Positive Shadows' regional level (local_tone::LocalToneMap::lift), on the same grid.
-    var region = 0.0;
-    let r = offset(P_LOCAL_REGION);
-    if r >= 0 {
-        let g = u32(r);
-        let top = grid[g + iy * w + ix] * (1.0 - tx) + grid[g + iy * w + jx] * tx;
-        let bottom = grid[g + jy * w + ix] * (1.0 - tx) + grid[g + jy * w + jx] * tx;
-        region = top * (1.0 - ty) + bottom * ty;
-    }
     if (V_MASKS && masked) && (delta[L_SHADOWS] != 0.0 || delta[L_HIGHLIGHTS] != 0.0) {
         let s = p(P_GLOBAL_SH) + delta[L_SHADOWS];
         let h = p(P_GLOBAL_SH + 1u) + delta[L_HIGHLIGHTS];
-        var lift = 0.0;
-        if r >= 0 {
-            lift = family(3u, s, 0.0, base - region, base - region) + family(4u, s, p(P_LOCAL_KEYS + 2u), region, region);
-        }
         // Positive Shadows and negative Highlights follow the photo's global rule
         // (`local_tone_rule`), scaled by the slider; the other signs their families.
         var sg = family(0u, s, p(P_LOCAL_KEYS), base, base);
@@ -612,13 +598,9 @@ fn local_gain(pos: vec2<f32>, lum: f32, clarity_lum: f32) -> f32 {
         if h < 0.0 && offset(P_RULE + 4u) >= 0 {
             hg = local_curve(P_RULE + 4u, base, base) * min(-h, 1.0);
         }
-        return exp2(sg + hg + lift + clarity);
+        return exp2(sg + hg + clarity);
     }
-    var lift = 0.0;
-    if r >= 0 {
-        lift = local_curve(P_LIFT, base - region, base - region) + local_curve(P_LIFT + 4u, region, region);
-    }
-    return exp2(local_curve(P_SHADOWS, base, base) + local_curve(P_HIGHLIGHTS, base, tail_base) + lift + clarity);
+    return exp2(local_curve(P_SHADOWS, base, base) + local_curve(P_HIGHLIGHTS, base, tail_base) + clarity);
 }
 // scene_tone::haze: the fraction of the haze positive Dehaze `s` removes.
 fn haze_omega(s_in: f32) -> f32 {
