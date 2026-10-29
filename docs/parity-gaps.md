@@ -65,6 +65,17 @@ own 1.41 → 1.50, own stress 2.28 → 2.46) and better on three (signature edit
 per set (a C-Lux, an L2D-20c) land 3 to 4 ΔE00 off under both the rule and the
 earlier fit, which the committed tables did not do; the interaction of white balance
 with the histogram rule is open. Other settings are untouched by the rule.
+It is not the clipped top: on a neutral synthetic scene (a dark textured field under a
+bright area clipped, partly clipped or under the clip, with an As Shot neutral of 1 or
+of 0.5, 1, 0.6 so the channels clip at different levels) Temperature 3500 and 8000
+shift every quantile and the top alike, so the rule's histogram keeps its shape to
+0.01 stop and the field's Shadows +100 lift moves 0.06 EV at most, on main and with
+#755's reconstruction. White balance must reach the rule through what that probe
+does not have: coloured areas, whose luminance moves against the neutrals', and
+profiles whose matrices follow the temperature (the probe's has one illuminant);
+whether Camera Raw's lift follows either is not measured. What the clipped top does change is the
+headroom: fully clipped pixels reconstructed a stop over white lift the same field
+3.33 EV instead of 2.64, as #755 found on the DC-S1 field.
 
 ### Per-level texture and the ensemble (2026-10-28)
 

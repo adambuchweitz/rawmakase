@@ -280,8 +280,31 @@ at 1024 −2 EV, 32 pixels −6 EV, 7 stops over the field), and the same pixels
 as scattered gaps or as a strip lift a dark scene differently (0.35 EV on the
 scene-probe test). Textured dark squares in a bright field, by contrast, are lifted
 by their level alone (depth 5: 1.8 to 2.4 EV from 16 to 512 pixels). The rule reads
-such scenes through the histogram alone: the shadow-gap probe lifts 0.4 EV against
-Camera Raw's 0.6.
+such scenes through the histogram alone. On the shadow-gap probe (2026-10-29) it lifts
+the scattered gaps 0.73 EV against Camera Raw's 0.79 (0.57 and 0.53 against 0.60 and
+0.57 at Exposure −2 and +2) and the same pixels sorted into a strip 0.74 against 0.44:
+the gap is the strip's over-lift, not the scattered scene's lift.
+
+A median prefilter of the base, after LightCraft's (a separable horizontal-then-vertical
+running median of log luminance before the edge-aware filter, there 0.15% of the long
+edge), does not help and is not in the engine. Tried at 1, 3 and 6 map pixels (0.2–1.2%
+of the 512-pixel map), feeding either the base and the rule or the rule's histogram
+alone, without refitting the rule (its training maps are not on every machine):
+
+- The strip is too large for the median, so its over-lift is unchanged (0.74).
+- The scattered gaps are unchanged up to 3 pixels; at 6 the median erases them and the
+  lift falls to 0.46, the wrong way (Camera Raw lifts the scattered arrangement more).
+- Tiny lights at white in a dark field lose their Highlights −100 pull once the median
+  is wider than they are: lights 3 and 5 pixels across (of 640) are pulled −1.3 and
+  −1.5 EV, at 3 pixels −0.2 (−0.6 with the rule's histogram alone), where Camera Raw
+  pulls such squares −1.1 to −2.8 EV (the size measurements above).
+- At 3 and 6 pixels the scene probes get further from Camera Raw (scene 3 and 4 at
+  Highlights −100, scene 4 at Shadows +100; at 6 also scene 1 at Highlights −100 and
+  scene 3 at Shadows +100); at 1 pixel nothing measurable changes.
+
+The lights do raise the rule's lift of the field around them (+0.15 EV for a few
+3-pixel lights, +0.5 to +1.3 EV for 17-pixel ones), which the median removes, but no
+Camera Raw reference of such a field exists yet to say which is right.
 
 ### Local operators
 
